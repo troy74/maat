@@ -8,12 +8,19 @@ use std::sync::Arc;
 
 use kameo::request::MessageSend;
 use maat_config::{
+    default_skill_dirs,
+    load_installed_skills,
+    prompts::PromptLibrary,
     secrets::build_resolver,
     MaatConfig,
 };
-use maat_core::{HeraldPayload, ModelSpec, SessionId, StatusEvent, ToolRegistry, TuiEvent, UserId};
+use maat_core::{
+    HeraldPayload, ModelCostTier, ModelLatencyTier, ModelProfile, ModelReasoningTier,
+    ModelRegistry, ModelRouteRule, ModelRouteScope, ModelSelectionPolicy, ModelProviderSpec,
+    ProviderApiStyle, SessionId, StatusEvent, ToolRegistry, TuiEvent, UserId,
+};
 use maat_llm::OpenAiCompatClient;
-use maat_memory::sqlite::SqliteStore;
+use maat_memory::{sqlite::SqliteStore, ContextConfig, MemoryStore};
 use maat_pharoh::{Inbound, Pharoh};
 use maat_vizier::Vizier;
 use tokio::sync::{broadcast, mpsc};
@@ -43,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         MaatConfig::default()
     });
     info!(model = %cfg.llm.model, db = %cfg.memory.db_path, "config loaded");
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // ── secret resolver ────────────────────────────────────────────
     let resolver = Arc::new(build_resolver(
@@ -57,14 +65,12 @@ async fn main() -> anyhow::Result<()> {
             "OpenRouter API key not found. Set OPENROUTER_API_KEY or store via `/secret set maat/openrouter/api_key`"
         ))?;
 
-    let model_id = std::env::var("MAAT_MODEL").unwrap_or_else(|_| cfg.llm.model.clone());
-    let spec = ModelSpec {
-        model_id: model_id.clone(),
-        base_url: cfg.llm.base_url.clone(),
-        api_key_env: "OPENROUTER_API_KEY".into(), // kept for compat; key already resolved above
-        temperature: 0.7,
-        max_tokens: 4096,
-    };
+    let model_registry = build_model_registry(&cfg);
+    let route_rules = Arc::new(build_model_route_rules(&cfg));
+    let spec = model_registry
+        .resolve_default_spec()
+        .ok_or_else(|| anyhow::anyhow!("No default model profile could be resolved"))?;
+    let model_id = spec.model_id.clone();
 
     // Temporarily set the env var so OpenAiCompatClient finds it.
     // Phase 12 will inject the key directly.
@@ -114,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
                 client_secret,
                 resolver.clone(),
                 Arc::new(cfg.clone()),
+                base_dir.clone(),
             )
             .register_all(&mut registry);
             info!("Google talent registered (gmail_send, calendar_list, calendar_create)");
@@ -138,15 +145,43 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // File tools — always available, scoped to the current working directory.
-    let base_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     maat_talents::FileTalent::new(base_dir).register_all(&mut registry);
     info!("File talent registered (file_read, file_write, file_list)");
 
+    let skill_dirs = default_skill_dirs(&cfg.skills.dirs);
+    let installed_skills = load_installed_skills(&skill_dirs);
+    installed_skills.register_tools(&mut registry);
     let tool_registry = Arc::new(registry);
-    let system_prompt = build_system_prompt(&tool_registry);
+    let mut capability_registry = tool_registry.capability_registry();
+    for card in installed_skills.capability_cards() {
+        capability_registry.register(card);
+    }
+    let capability_registry = Arc::new(capability_registry);
+    let installed_skill_summaries = installed_skills
+        .all()
+        .iter()
+        .map(|skill| {
+            format!(
+                "{}:{:?}:{:?}",
+                skill.name,
+                skill.source,
+                skill.trust,
+            )
+        })
+        .collect::<Vec<_>>();
+    info!(
+        capabilities = capability_registry.ids().len(),
+        installed_skills = installed_skill_summaries.len(),
+        skill_summaries = ?installed_skill_summaries,
+        "capability registry ready"
+    );
+    let model_registry = Arc::new(model_registry);
+    let user_id = UserId("user".into());
+    let prompts = PromptLibrary::load(&cfg.prompts.dir);
+    let system_prompt = build_system_prompt(&tool_registry, &prompts, &user_id.0);
 
     // ── memory store ───────────────────────────────────────────────
-    let store: Arc<dyn maat_memory::MemoryStore> =
+    let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(std::path::Path::new(&cfg.memory.db_path))?);
     info!(db = %cfg.memory.db_path, "memory store ready");
 
@@ -159,14 +194,20 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── actors ─────────────────────────────────────────────────────
-    let user_id = UserId("user".into());
-    let session_id = SessionId::new();
+    let session_id = load_primary_session_id(store.as_ref(), &user_id)
+        .await
+        .unwrap_or_else(SessionId::new);
+    let ctx_config = ContextConfig::new(cfg.llm.token_budget, cfg.llm.compaction_threshold);
 
     let primary_vizier = kameo::spawn(Vizier::new(
         user_id.clone(),
         session_id.clone(),
         llm.clone(),
         tool_registry.clone(),
+        capability_registry.clone(),
+        model_registry.clone(),
+        route_rules.clone(),
+        prompts.capability_nudge.clone(),
         status_tx.clone(),
     ));
 
@@ -178,10 +219,16 @@ async fn main() -> anyhow::Result<()> {
         llm,
         tool_registry,
         store,
+        ctx_config,
+        spec,
+        model_registry,
+        route_rules,
+        capability_registry,
+        prompts.clone(),
         Arc::new(cfg),
         resolver,
         status_tx,
-    ));
+    ).await);
 
     // ── channels ───────────────────────────────────────────────────
     let (user_tx, mut user_rx) = mpsc::channel::<HeraldPayload>(32);
@@ -208,25 +255,216 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_system_prompt(registry: &ToolRegistry) -> String {
+fn build_system_prompt(registry: &ToolRegistry, prompts: &PromptLibrary, user_id: &str) -> String {
     let defs = registry.all_definitions();
     if defs.is_empty() {
-        return "You are MAAT, a thoughtful and concise AI assistant.".into();
+        return prompts.render_primary_system(user_id, "");
     }
     let tool_lines: Vec<String> = defs
         .iter()
         .map(|d| format!("  - {} — {}", d.name, d.description))
         .collect();
-    format!(
-        "You are MAAT, a thoughtful and concise AI assistant.\n\n\
-         You have access to the following tools and MUST use them when relevant \
-         instead of saying you cannot perform a task:\n{}\n\n\
-         Rules:\n\
-         - Call tools immediately when relevant rather than apologising or suggesting alternatives.\n\
-         - After every tool call, always report the outcome to the user in plain language \
-           (e.g. \"Done — wrote 42 bytes to notes.txt\" or \"Sent email to alice@example.com\").\n\
-         - If a tool returns an error, explain what went wrong and suggest how to fix it.\n\
-         - Be concise: one or two sentences of confirmation is enough unless the user asked for detail.",
-        tool_lines.join("\n")
-    )
+    prompts.render_primary_system(user_id, &tool_lines.join("\n"))
+}
+
+async fn load_primary_session_id(
+    store: &dyn MemoryStore,
+    user_id: &UserId,
+) -> Option<SessionId> {
+    let meta = store
+        .load_session_meta_by_user_and_name(&user_id.0, "primary")
+        .await
+        .ok()
+        .flatten()?;
+    let parsed = meta.session_id.parse::<ulid::Ulid>().ok()?;
+    Some(SessionId(parsed))
+}
+
+fn build_model_registry(cfg: &MaatConfig) -> ModelRegistry {
+    let mut registry = ModelRegistry::new();
+
+    registry.register_provider(ModelProviderSpec {
+        id: "openrouter".into(),
+        api_style: ProviderApiStyle::OpenAiCompat,
+        base_url: cfg.llm.base_url.clone(),
+        api_key_env: "OPENROUTER_API_KEY".into(),
+    });
+
+    registry.register_profile(ModelProfile {
+        id: "default".into(),
+        provider_id: "openrouter".into(),
+        model_id: std::env::var("MAAT_MODEL").unwrap_or_else(|_| cfg.llm.model.clone()),
+        temperature: 0.7,
+        max_tokens: 4096,
+        cost_tier: ModelCostTier::Standard,
+        latency_tier: ModelLatencyTier::Balanced,
+        reasoning_tier: ModelReasoningTier::Medium,
+        context_window: cfg.llm.token_budget,
+        supports_tool_calling: true,
+        tags: vec!["default".into()],
+        traits: vec![maat_core::ModelTrait::ToolCalling],
+    });
+
+    registry.register_profile(ModelProfile {
+        id: "image_preview".into(),
+        provider_id: "openrouter".into(),
+        model_id: "google/gemini-3.1-flash-image-preview".into(),
+        temperature: 0.4,
+        max_tokens: 4096,
+        cost_tier: ModelCostTier::Premium,
+        latency_tier: ModelLatencyTier::Balanced,
+        reasoning_tier: ModelReasoningTier::Medium,
+        context_window: 32_768,
+        supports_tool_calling: false,
+        tags: vec!["image".into(), "generate".into(), "edit".into()],
+        traits: vec![maat_core::ModelTrait::Vision],
+    });
+
+    for (provider_id, provider) in &cfg.llm.providers {
+        registry.register_provider(ModelProviderSpec {
+            id: provider_id.clone(),
+            api_style: ProviderApiStyle::OpenAiCompat,
+            base_url: provider.base_url.clone(),
+            api_key_env: provider.api_key_env.clone(),
+        });
+    }
+
+    for (profile_id, profile) in &cfg.llm.profiles {
+        registry.register_profile(ModelProfile {
+            id: profile_id.clone(),
+            provider_id: profile.provider.clone(),
+            model_id: profile.model_id.clone(),
+            temperature: profile.temperature,
+            max_tokens: profile.max_tokens,
+            cost_tier: ModelCostTier::Standard,
+            latency_tier: ModelLatencyTier::Balanced,
+            reasoning_tier: ModelReasoningTier::Medium,
+            context_window: cfg.llm.token_budget,
+            supports_tool_calling: true,
+            tags: profile.tags.clone(),
+            traits: vec![],
+        });
+    }
+
+    registry.set_default_profile(
+        cfg.llm.routing.default_profile.clone().unwrap_or_else(|| "default".into())
+    );
+    registry
+}
+
+fn build_model_route_rules(cfg: &MaatConfig) -> Vec<ModelRouteRule> {
+    let mut rules = Vec::new();
+
+    let global_policy = ModelSelectionPolicy {
+        preferred_profiles: Vec::new(),
+        allow_profiles: cfg.llm.routing.allow_profiles.clone(),
+        deny_profiles: cfg.llm.routing.deny_profiles.clone(),
+        required_traits: Vec::new(),
+        max_cost_tier: None,
+        max_latency_tier: None,
+        min_reasoning_tier: None,
+        require_tool_calling: None,
+    };
+    if !global_policy.allow_profiles.is_empty() || !global_policy.deny_profiles.is_empty() {
+        rules.push(ModelRouteRule {
+            scope: ModelRouteScope::Global,
+            policy: global_policy,
+            fallback_profile: cfg.llm.routing.default_profile.clone(),
+        });
+    }
+
+    if let Some(profile) = &cfg.llm.routing.pharoh_profile {
+        rules.push(preferred_profile_rule(
+            ModelRouteScope::PharohPrimary,
+            profile.clone(),
+        ));
+    }
+    if let Some(profile) = &cfg.llm.routing.session_default_profile {
+        rules.push(preferred_profile_rule(
+            ModelRouteScope::SessionDefault,
+            profile.clone(),
+        ));
+    }
+    if let Some(profile) = &cfg.llm.routing.planner_profile {
+        rules.push(preferred_profile_rule(
+            ModelRouteScope::Planner,
+            profile.clone(),
+        ));
+    }
+    if let Some(profile) = &cfg.llm.routing.capability_nudge_profile {
+        rules.push(preferred_profile_rule(
+            ModelRouteScope::CapabilityNudge,
+            profile.clone(),
+        ));
+    }
+
+    rules.push(preferred_profile_rule(
+        ModelRouteScope::Intent("image_generate".into()),
+        "image_preview".into(),
+    ));
+    rules.push(preferred_profile_rule(
+        ModelRouteScope::Intent("image_edit".into()),
+        "image_preview".into(),
+    ));
+
+    for (route_key, route) in &cfg.llm.routing.routes {
+        if let Some(scope) = parse_route_scope(route_key) {
+            rules.push(ModelRouteRule {
+                scope,
+                policy: ModelSelectionPolicy {
+                    preferred_profiles: route.prefer_profiles.clone(),
+                    allow_profiles: route.allow_profiles.clone(),
+                    deny_profiles: route.deny_profiles.clone(),
+                    required_traits: Vec::new(),
+                    max_cost_tier: None,
+                    max_latency_tier: None,
+                    min_reasoning_tier: None,
+                    require_tool_calling: None,
+                },
+                fallback_profile: route.fallback_profile.clone(),
+            });
+        }
+    }
+
+    rules
+}
+
+fn preferred_profile_rule(scope: ModelRouteScope, profile: String) -> ModelRouteRule {
+    ModelRouteRule {
+        scope,
+        policy: ModelSelectionPolicy {
+            preferred_profiles: vec![profile.clone()],
+            allow_profiles: Vec::new(),
+            deny_profiles: Vec::new(),
+            required_traits: Vec::new(),
+            max_cost_tier: None,
+            max_latency_tier: None,
+            min_reasoning_tier: None,
+            require_tool_calling: None,
+        },
+        fallback_profile: Some(profile),
+    }
+}
+
+fn parse_route_scope(route_key: &str) -> Option<ModelRouteScope> {
+    match route_key {
+        "global" => Some(ModelRouteScope::Global),
+        "pharoh" => Some(ModelRouteScope::PharohPrimary),
+        "session_default" => Some(ModelRouteScope::SessionDefault),
+        "planner" => Some(ModelRouteScope::Planner),
+        "capability_nudge" => Some(ModelRouteScope::CapabilityNudge),
+        "summarizer" => Some(ModelRouteScope::Summarizer),
+        _ => {
+            let (prefix, value) = route_key.split_once(':')?;
+            match prefix {
+                "capability" => Some(ModelRouteScope::Capability(maat_core::CapabilityId(value.to_string()))),
+                "intent" => Some(ModelRouteScope::Intent(value.to_string())),
+                "capability_tag" => Some(ModelRouteScope::CapabilityTag(value.to_string())),
+                "talent" => Some(ModelRouteScope::Talent(value.to_string())),
+                "skill" => Some(ModelRouteScope::Skill(value.to_string())),
+                "session" => Some(ModelRouteScope::SessionNamed(value.to_string())),
+                _ => None,
+            }
+        }
+    }
 }

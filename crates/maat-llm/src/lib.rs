@@ -21,9 +21,11 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use maat_core::{
-    ChatMessage, LlmToolDef, MaatError, ModelSpec, PendingToolCall, Role, StopReason,
-    TokenUsage,
+    ChatMessage, GeneratedArtifact, LlmToolDef, MaatError, ModelSpec, PendingToolCall, Role,
+    StopReason, TokenUsage,
 };
+use serde_json::json;
+use tracing::debug;
 
 // ─────────────────────────────────────────────
 // Response
@@ -36,6 +38,7 @@ pub struct CompletionResponse {
     pub latency_ms: u64,
     /// Populated when stop_reason == ToolUse.
     pub tool_calls: Vec<PendingToolCall>,
+    pub generated_artifacts: Vec<GeneratedArtifact>,
 }
 
 // ─────────────────────────────────────────────
@@ -57,7 +60,11 @@ pub trait LlmClient: Send + Sync {
 
 pub struct OpenAiCompatClient {
     client: Client<OpenAIConfig>,
+    http: reqwest::Client,
+    api_base: String,
+    api_key: String,
     model_id: String,
+    profile_id: Option<String>,
     max_tokens: u32,
     temperature: f32,
 }
@@ -73,11 +80,15 @@ impl OpenAiCompatClient {
 
         let config = OpenAIConfig::new()
             .with_api_base(&spec.base_url)
-            .with_api_key(api_key);
+            .with_api_key(&api_key);
 
         Ok(Self {
             client: Client::with_config(config),
+            http: reqwest::Client::new(),
+            api_base: spec.base_url.clone(),
+            api_key,
             model_id: spec.model_id.clone(),
+            profile_id: spec.profile_id.clone(),
             max_tokens: spec.max_tokens,
             temperature: spec.temperature,
         })
@@ -151,6 +162,51 @@ fn to_api_tool(t: &LlmToolDef) -> ChatCompletionTool {
     }
 }
 
+fn to_json_message(m: ChatMessage) -> serde_json::Value {
+    match m.role {
+        Role::System => json!({
+            "role": "system",
+            "content": m.content,
+        }),
+        Role::User => json!({
+            "role": "user",
+            "content": m.content,
+        }),
+        Role::Assistant => {
+            let tool_calls = m
+                .tool_calls_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<PendingToolCall>>(raw).ok())
+                .map(|calls| {
+                    calls.into_iter().map(|tc| {
+                        json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.input.to_string(),
+                            }
+                        })
+                    }).collect::<Vec<_>>()
+                });
+
+            let mut value = json!({
+                "role": "assistant",
+                "content": m.content,
+            });
+            if let Some(tool_calls) = tool_calls {
+                value["tool_calls"] = serde_json::Value::Array(tool_calls);
+            }
+            value
+        }
+        Role::Tool => json!({
+            "role": "tool",
+            "tool_call_id": m.tool_call_id.unwrap_or_default(),
+            "content": m.content,
+        }),
+    }
+}
+
 // ─────────────────────────────────────────────
 // Implementation
 // ─────────────────────────────────────────────
@@ -162,6 +218,10 @@ impl LlmClient for OpenAiCompatClient {
         messages: Vec<ChatMessage>,
         tools: &[LlmToolDef],
     ) -> Result<CompletionResponse, MaatError> {
+        if self.should_request_image_output() {
+            return self.complete_with_image_output(messages, tools).await;
+        }
+
         let api_messages: Vec<ChatCompletionRequestMessage> = messages
             .into_iter()
             .map(to_api_message)
@@ -230,6 +290,281 @@ impl LlmClient for OpenAiCompatClient {
             "← LLM"
         );
 
-        Ok(CompletionResponse { content, stop_reason, usage, latency_ms, tool_calls })
+        Ok(CompletionResponse {
+            content,
+            stop_reason,
+            usage,
+            latency_ms,
+            tool_calls,
+            generated_artifacts: vec![],
+        })
+    }
+}
+
+impl OpenAiCompatClient {
+    fn should_request_image_output(&self) -> bool {
+        self.profile_id.as_deref() == Some("image_preview")
+            || self.model_id.contains("image-preview")
+    }
+
+    async fn complete_with_image_output(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: &[LlmToolDef],
+    ) -> Result<CompletionResponse, MaatError> {
+        let api_messages = messages.into_iter().map(to_json_message).collect::<Vec<_>>();
+        let mut body = json!({
+            "model": self.model_id,
+            "messages": api_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "modalities": ["image", "text"],
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(
+                tools.iter().map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
+                }).collect()
+            );
+        }
+
+        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let t0 = std::time::Instant::now();
+        let response = self.http
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| MaatError::Llm(e.to_string()))?;
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let status = response.status();
+        let raw_json = response
+            .text()
+            .await
+            .map_err(|e| MaatError::Llm(e.to_string()))?;
+        if !status.is_success() {
+            return Err(MaatError::Llm(format!("{}: {}", status, raw_json)));
+        }
+        debug!(
+            model = %self.model_id,
+            raw_preview = %truncate_for_log(&raw_json, 1200),
+            "image-output raw response"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&raw_json)
+            .map_err(|e| MaatError::Llm(format!("invalid chat completion json: {e}")))?;
+        let choice = payload
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .ok_or_else(|| MaatError::Llm("no choices returned".into()))?;
+        let message = choice
+            .get("message")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let content = message
+            .get("content")
+            .and_then(json_content_to_string)
+            .unwrap_or_default();
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(|calls| calls.as_array())
+            .map(|calls| {
+                calls.iter().map(|tc| PendingToolCall {
+                    id: tc.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    name: tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    input: tc.get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|raw| serde_json::from_str(raw).ok())
+                        .unwrap_or_default(),
+                }).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let generated_artifacts = message
+            .get("images")
+            .and_then(|images| images.as_array())
+            .map(|images| parse_generated_images(images))
+            .filter(|artifacts| !artifacts.is_empty())
+            .or_else(|| {
+                message
+                    .get("content")
+                    .and_then(|content| parse_generated_images_from_content(content))
+            })
+            .unwrap_or_default();
+
+        let finish_reason = choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let stop_reason = match finish_reason {
+            "tool_calls" => StopReason::ToolUse,
+            "length" => StopReason::MaxTokens,
+            _ => StopReason::EndTurn,
+        };
+        let usage = TokenUsage {
+            input_tokens: payload.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            output_tokens: payload.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        };
+
+        let content = if content.trim().is_empty() && generated_artifacts.is_empty() {
+            "Image generation returned no parseable image payload.".to_string()
+        } else {
+            content
+        };
+
+        Ok(CompletionResponse {
+            content,
+            stop_reason,
+            usage,
+            latency_ms,
+            tool_calls,
+            generated_artifacts,
+        })
+    }
+}
+
+fn json_content_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    value.as_array().map(|parts| {
+        parts.iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|text| text.to_string())
+                    .or_else(|| {
+                        part.get("type")
+                            .and_then(|v| v.as_str())
+                            .filter(|kind| *kind == "output_text")
+                            .and_then(|_| part.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    })
+                    .or_else(|| {
+                        part.get("type")
+                            .and_then(|v| v.as_str())
+                            .filter(|kind| *kind == "text")
+                            .and_then(|_| part.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn parse_generated_images(images: &[serde_json::Value]) -> Vec<GeneratedArtifact> {
+    images
+        .iter()
+        .enumerate()
+        .filter_map(|(index, image)| {
+            let image_url = extract_image_url(image)?;
+            let (mime_type, data_base64) = parse_image_payload(&image_url)?;
+            let suggested_name =
+                format!("generated-image-{}.{}", index + 1, image_extension(&mime_type));
+            Some(GeneratedArtifact {
+                kind: "image".into(),
+                mime_type,
+                suggested_name,
+                summary: "Generated image output".into(),
+                data_base64,
+            })
+        })
+        .collect()
+}
+
+fn parse_data_url(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let mime_type = meta.split(';').next()?;
+    Some((mime_type, data))
+}
+
+fn parse_generated_images_from_content(content: &serde_json::Value) -> Option<Vec<GeneratedArtifact>> {
+    let parts = content.as_array()?;
+    let images = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let image_url = extract_image_url(part)?;
+            let (mime_type, data_base64) = parse_image_payload(&image_url)?;
+            let suggested_name =
+                format!("generated-image-{}.{}", index + 1, image_extension(&mime_type));
+            Some(GeneratedArtifact {
+                kind: "image".into(),
+                mime_type,
+                suggested_name,
+                summary: "Generated image output".into(),
+                data_base64,
+            })
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        None
+    } else {
+        Some(images)
+    }
+}
+
+fn extract_image_url(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("image_url")
+        .and_then(|inner| inner.as_str().map(ToString::to_string).or_else(|| {
+            inner.get("url").and_then(|url| url.as_str()).map(ToString::to_string)
+        }))
+        .or_else(|| {
+            value
+                .get("imageUrl")
+                .and_then(|inner| inner.as_str().map(ToString::to_string).or_else(|| {
+                    inner.get("url").and_then(|url| url.as_str()).map(ToString::to_string)
+                }))
+        })
+        .or_else(|| value.get("url").and_then(|url| url.as_str()).map(ToString::to_string))
+}
+
+fn parse_image_payload(value: &str) -> Option<(String, String)> {
+    if let Some((mime_type, data_base64)) = parse_data_url(value) {
+        return Some((mime_type.to_string(), data_base64.to_string()));
+    }
+    None
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    }
+}
+
+fn truncate_for_log(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else {
+        format!("{}...", &value[..max_len])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_generated_images_from_data_urls() {
+        let images = vec![json!({
+            "image_url": "data:image/png;base64,QUJDRA=="
+        })];
+        let parsed = parse_generated_images(&images);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].mime_type, "image/png");
+        assert_eq!(parsed[0].data_base64, "QUJDRA==");
     }
 }

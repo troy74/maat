@@ -15,7 +15,19 @@
 //!   `maat/openrouter/api_key`, `maat/imap/password`, `maat/google/client_secret`
 
 pub mod config;
+pub mod prompts;
 pub mod secrets;
+pub mod skills;
 
-pub use config::{ConfigError, GoogleConfig, ImapConfig, LlmConfig, MaatConfig, MemoryConfig};
+pub use config::{
+    ConfigError, GoogleConfig, ImapConfig, LlmConfig, MaatConfig, MemoryConfig,
+    ModelProfileConfig, ModelProviderConfig, ModelRouteConfig, ModelRoutingConfig,
+    PromptConfig, SkillsConfig,
+};
+pub use prompts::{PromptAssetInfo, PromptLibrary, UpdatePolicy};
 pub use secrets::{SecretResolver, SecretStore};
+pub use skills::{
+    default_skill_dirs, install_skill, install_skill_from_dir, load_installed_skills,
+    search_clawhub, InstallSource, InstalledSkill, InstalledSkillManifest, SkillRegistry,
+    SkillSource,
+};

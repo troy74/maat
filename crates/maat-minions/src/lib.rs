@@ -11,12 +11,13 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashSet;
 
 use kameo::Actor;
 use maat_core::{
-    ChatMessage, ComponentAddress, EnvelopeHeader, MaatError, ResultEnvelope, SessionId,
-    StatusEvent, StatusKind, StepState, TaskEnvelope, TaskOutcome, TokenUsage, ToolRegistry,
-    TraceId, UserId,
+    CapabilityId, ChatMessage, ComponentAddress, EnvelopeHeader, MaatError, ResultEnvelope,
+    SessionId, StatusEvent, StatusKind, StepState, TaskEnvelope, TaskOutcome, TokenUsage,
+    ToolRegistry, TraceId, UserId,
 };
 use maat_llm::LlmClient;
 use tokio::sync::broadcast;
@@ -48,22 +49,25 @@ impl Minion {
         Self { user_id, session_id, llm, tool_registry, status_tx }
     }
 
-    fn emit(&self, trace_id: &TraceId, kind: StatusKind) {
+    fn emit(&self, trace_id: &TraceId, step_id: &maat_core::StepId, kind: StatusKind) {
         let source = ComponentAddress::Minion(
             self.user_id.clone(),
             self.session_id.clone(),
-            maat_core::StepId::new(),
+            step_id.clone(),
         );
         let _ = self.status_tx.send(StatusEvent::new(source, trace_id.clone(), kind));
     }
 
     /// Drive the LLM → tool-call → inject loop until the model stops requesting tools
-    /// or MAX_TOOL_ROUNDS is exhausted. Returns (final_content, cumulative_usage, latency_ms).
+    /// or MAX_TOOL_ROUNDS is exhausted. Returns final content plus any generated artifacts.
     async fn run_agentic_loop(
         &self,
         messages: Vec<ChatMessage>,
-    ) -> Result<(String, TokenUsage, u64), MaatError> {
-        let tool_defs = self.tool_registry.all_definitions();
+        capability_refs: &[CapabilityId],
+    ) -> Result<(String, Vec<maat_core::GeneratedArtifact>, TokenUsage, u64), MaatError> {
+        let allowed_tool_names: Vec<String> = capability_refs.iter().map(|id| id.0.clone()).collect();
+        let allowed_tool_set: HashSet<String> = allowed_tool_names.iter().cloned().collect();
+        let tool_defs = self.tool_registry.definitions_for_names(&allowed_tool_names);
         let mut messages = messages;
         let mut total_usage = TokenUsage::default();
         let t0 = Instant::now();
@@ -75,8 +79,8 @@ impl Minion {
 
             if resp.tool_calls.is_empty() {
                 let latency_ms = t0.elapsed().as_millis() as u64;
-                debug!(round, "agentic loop done");
-                return Ok((resp.content, total_usage, latency_ms));
+                debug!(round, generated_artifacts = resp.generated_artifacts.len(), "agentic loop done");
+                return Ok((resp.content, resp.generated_artifacts, total_usage, latency_ms));
             }
 
             debug!(round, tools = resp.tool_calls.len(), "dispatching tool calls");
@@ -86,11 +90,16 @@ impl Minion {
 
             // Execute each tool call and inject results.
             for tc in &resp.tool_calls {
-                let result = self
-                    .tool_registry
-                    .call_by_name(&tc.name, tc.input.clone())
-                    .await
-                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+                let result = if allowed_tool_set.contains(&tc.name) {
+                    self.tool_registry
+                        .call_by_name(&tc.name, tc.input.clone())
+                        .await
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                } else {
+                    serde_json::json!({
+                        "error": format!("tool '{}' is not available for this task", tc.name)
+                    })
+                };
                 messages.push(ChatMessage::tool_result(tc.id.clone(), result.to_string()));
             }
         }
@@ -122,6 +131,7 @@ impl kameo::message::Message<RunTask> for Minion {
         // ── emit Running ────────────────────────────────────────────
         self.emit(
             &trace_id,
+            &step_id,
             StatusKind::StepState {
                 workflow_id: workflow_id.clone(),
                 step_id: step_id.clone(),
@@ -134,20 +144,28 @@ impl kameo::message::Message<RunTask> for Minion {
 
         let loop_result = tokio::time::timeout(
             timeout_dur,
-            self.run_agentic_loop(env.task.messages.clone()),
+            self.run_agentic_loop(env.task.messages.clone(), &env.task.capability_refs),
         )
         .await;
 
         // ── map to TaskOutcome ──────────────────────────────────────
         let (outcome, usage, latency_ms) = match loop_result {
-            Ok(Ok((content, usage, latency_ms))) => {
+            Ok(Ok((content, generated_artifacts, usage, latency_ms))) => {
                 debug!(
                     in_tok = usage.input_tokens,
                     out_tok = usage.output_tokens,
                     latency_ms,
                     "minion complete"
                 );
-                (TaskOutcome::Success { content, tool_calls_made: vec![] }, usage, latency_ms)
+                (
+                    TaskOutcome::Success {
+                        content,
+                        tool_calls_made: vec![],
+                        generated_artifacts,
+                    },
+                    usage,
+                    latency_ms,
+                )
             }
             Ok(Err(e)) => {
                 warn!(error = %e, "minion LLM error");
@@ -167,6 +185,7 @@ impl kameo::message::Message<RunTask> for Minion {
         let step_state = step_state_from_outcome(&outcome);
         self.emit(
             &trace_id,
+            &step_id,
             StatusKind::StepState {
                 workflow_id: workflow_id.clone(),
                 step_id: step_id.clone(),

@@ -18,7 +18,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mailparse::MailHeaderMap;
-use maat_core::{LlmToolDef, MaatError, Tool, ToolRegistry};
+use maat_core::{
+    CapabilityCard, CapabilityId, CapabilityKind, CapabilityProvenance, CapabilityRoutingHints,
+    CapabilityTrust, CostProfile, LlmToolDef, MaatError, ModelSelectionPolicy, ModelTrait,
+    Permission, Tool, ToolRegistry,
+};
 use serde_json::{json, Value};
 
 // ─────────────────────────────────────────────
@@ -126,6 +130,17 @@ impl Tool for EmailList {
         }
     }
 
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(email_capability_card(
+            &def,
+            "Email List",
+            vec!["email".into(), "list".into(), "read".into()],
+            900,
+            600,
+        ))
+    }
+
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
         let folder = input["folder"].as_str().unwrap_or("INBOX").to_string();
         let count = input["count"].as_u64().unwrap_or(10).min(50) as u32;
@@ -231,6 +246,17 @@ impl Tool for EmailRead {
         }
     }
 
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(email_capability_card(
+            &def,
+            "Email Read",
+            vec!["email".into(), "read".into(), "detail".into()],
+            1300,
+            1200,
+        ))
+    }
+
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
         let uid = input["uid"]
             .as_str()
@@ -323,6 +349,17 @@ impl Tool for EmailSearch {
         }
     }
 
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(email_capability_card(
+            &def,
+            "Email Search",
+            vec!["email".into(), "search".into(), "read".into()],
+            1000,
+            700,
+        ))
+    }
+
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
         let query = input["query"]
             .as_str()
@@ -375,5 +412,46 @@ impl Tool for EmailSearch {
         })
         .await
         .map_err(|e| MaatError::Tool(format!("spawn_blocking: {e}")))?
+    }
+}
+
+fn email_capability_card(
+    def: &LlmToolDef,
+    display_name: &str,
+    tags: Vec<String>,
+    avg_latency_ms: u64,
+    estimated_tokens: u32,
+) -> CapabilityCard {
+    CapabilityCard {
+        id: CapabilityId(def.name.clone()),
+        name: display_name.into(),
+        semantic_description: def.description.clone(),
+        kind: CapabilityKind::Talent,
+        input_schema: def.parameters.clone(),
+        output_schema: json!({ "type": "object" }),
+        cost_profile: CostProfile { avg_latency_ms, estimated_tokens },
+        tags,
+        semantic_terms: Vec::new(),
+        trust: CapabilityTrust::Core,
+        provenance: CapabilityProvenance {
+            source: "compiled_talent".into(),
+            path: None,
+            reference: None,
+        },
+        permissions: vec![Permission::Email, Permission::Network],
+        routing_hints: Some(CapabilityRoutingHints {
+            preferred_tags: vec!["email".into()],
+            avoids_tags: vec![],
+            model_policy: Some(ModelSelectionPolicy {
+                preferred_profiles: vec![],
+                allow_profiles: vec![],
+                deny_profiles: vec![],
+                required_traits: vec![ModelTrait::ToolCalling, ModelTrait::StructuredOutput],
+                max_cost_tier: None,
+                max_latency_tier: None,
+                min_reasoning_tier: None,
+                require_tool_calling: Some(true),
+            }),
+        }),
     }
 }

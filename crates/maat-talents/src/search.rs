@@ -9,7 +9,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use maat_core::{LlmToolDef, MaatError, Tool, ToolRegistry};
+use maat_core::{
+    CapabilityCard, CapabilityId, CapabilityKind, CapabilityProvenance, CapabilityRoutingHints,
+    CapabilityTrust, CostProfile, LlmToolDef, MaatError, ModelSelectionPolicy, ModelTrait,
+    Permission, Tool, ToolRegistry,
+};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -67,6 +71,42 @@ impl Tool for WebSearch {
                 "required": ["query"]
             }),
         }
+    }
+
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(CapabilityCard {
+            id: CapabilityId(def.name.clone()),
+            name: "Web Search".into(),
+            semantic_description: def.description.clone(),
+            kind: CapabilityKind::Talent,
+            input_schema: def.parameters,
+            output_schema: json!({ "type": "object" }),
+            cost_profile: CostProfile { avg_latency_ms: 1800, estimated_tokens: 800 },
+            tags: vec!["search".into(), "web".into(), "current-events".into()],
+            semantic_terms: Vec::new(),
+            trust: CapabilityTrust::Core,
+            provenance: CapabilityProvenance {
+                source: "compiled_talent".into(),
+                path: None,
+                reference: None,
+            },
+            permissions: vec![Permission::Network],
+            routing_hints: Some(CapabilityRoutingHints {
+                preferred_tags: vec!["search".into()],
+                avoids_tags: vec!["premium".into()],
+                model_policy: Some(ModelSelectionPolicy {
+                    preferred_profiles: vec![],
+                    allow_profiles: vec![],
+                    deny_profiles: vec![],
+                    required_traits: vec![ModelTrait::ToolCalling, ModelTrait::FastResponse],
+                    max_cost_tier: None,
+                    max_latency_tier: None,
+                    min_reasoning_tier: None,
+                    require_tool_calling: Some(true),
+                }),
+            }),
+        })
     }
 
     async fn call(&self, input: Value) -> Result<Value, MaatError> {

@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use maat_core::{LlmToolDef, MaatError, Tool, ToolRegistry};
+use maat_core::{
+    CapabilityCard, CapabilityId, CapabilityKind, CapabilityProvenance, CapabilityRoutingHints,
+    CapabilityTrust, CostProfile, LlmToolDef, MaatError, ModelSelectionPolicy, ModelTrait,
+    Permission, Tool, ToolRegistry,
+};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -119,6 +123,42 @@ impl Tool for FileRead {
         }
     }
 
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(CapabilityCard {
+            id: CapabilityId(def.name.clone()),
+            name: "File Read".into(),
+            semantic_description: def.description.clone(),
+            kind: CapabilityKind::Talent,
+            input_schema: def.parameters,
+            output_schema: json!({ "type": "object" }),
+            cost_profile: CostProfile { avg_latency_ms: 50, estimated_tokens: 1200 },
+            tags: vec!["filesystem".into(), "read".into(), "analysis".into()],
+            semantic_terms: Vec::new(),
+            trust: CapabilityTrust::Core,
+            provenance: CapabilityProvenance {
+                source: "compiled_talent".into(),
+                path: None,
+                reference: None,
+            },
+            permissions: vec![Permission::FileRead],
+            routing_hints: Some(CapabilityRoutingHints {
+                preferred_tags: vec!["code".into(), "filesystem".into()],
+                avoids_tags: vec![],
+                model_policy: Some(ModelSelectionPolicy {
+                    preferred_profiles: vec![],
+                    allow_profiles: vec![],
+                    deny_profiles: vec![],
+                    required_traits: vec![ModelTrait::StructuredOutput],
+                    max_cost_tier: None,
+                    max_latency_tier: None,
+                    min_reasoning_tier: None,
+                    require_tool_calling: Some(true),
+                }),
+            }),
+        })
+    }
+
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
         let user_path = input["path"]
             .as_str()
@@ -200,6 +240,42 @@ impl Tool for FileWrite {
                 "required": ["path", "content"]
             }),
         }
+    }
+
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(CapabilityCard {
+            id: CapabilityId(def.name.clone()),
+            name: "File Write".into(),
+            semantic_description: def.description.clone(),
+            kind: CapabilityKind::Talent,
+            input_schema: def.parameters,
+            output_schema: json!({ "type": "object" }),
+            cost_profile: CostProfile { avg_latency_ms: 80, estimated_tokens: 900 },
+            tags: vec!["filesystem".into(), "write".into()],
+            semantic_terms: Vec::new(),
+            trust: CapabilityTrust::Core,
+            provenance: CapabilityProvenance {
+                source: "compiled_talent".into(),
+                path: None,
+                reference: None,
+            },
+            permissions: vec![Permission::FileWrite],
+            routing_hints: Some(CapabilityRoutingHints {
+                preferred_tags: vec!["filesystem".into()],
+                avoids_tags: vec![],
+                model_policy: Some(ModelSelectionPolicy {
+                    preferred_profiles: vec![],
+                    allow_profiles: vec![],
+                    deny_profiles: vec![],
+                    required_traits: vec![ModelTrait::StructuredOutput],
+                    max_cost_tier: None,
+                    max_latency_tier: None,
+                    min_reasoning_tier: None,
+                    require_tool_calling: Some(true),
+                }),
+            }),
+        })
     }
 
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
@@ -293,6 +369,42 @@ impl Tool for FileList {
         }
     }
 
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(CapabilityCard {
+            id: CapabilityId(def.name.clone()),
+            name: "File List".into(),
+            semantic_description: def.description.clone(),
+            kind: CapabilityKind::Talent,
+            input_schema: def.parameters,
+            output_schema: json!({ "type": "object" }),
+            cost_profile: CostProfile { avg_latency_ms: 40, estimated_tokens: 300 },
+            tags: vec!["filesystem".into(), "browse".into()],
+            semantic_terms: Vec::new(),
+            trust: CapabilityTrust::Core,
+            provenance: CapabilityProvenance {
+                source: "compiled_talent".into(),
+                path: None,
+                reference: None,
+            },
+            permissions: vec![Permission::FileRead],
+            routing_hints: Some(CapabilityRoutingHints {
+                preferred_tags: vec!["filesystem".into()],
+                avoids_tags: vec![],
+                model_policy: Some(ModelSelectionPolicy {
+                    preferred_profiles: vec![],
+                    allow_profiles: vec![],
+                    deny_profiles: vec![],
+                    required_traits: vec![ModelTrait::FastResponse],
+                    max_cost_tier: None,
+                    max_latency_tier: None,
+                    min_reasoning_tier: None,
+                    require_tool_calling: Some(true),
+                }),
+            }),
+        })
+    }
+
     async fn call(&self, input: Value) -> Result<Value, MaatError> {
         let user_path = input["path"].as_str().unwrap_or(".");
         let abs_path = safe_path(&self.base_dir, user_path)?;
@@ -307,7 +419,7 @@ impl Tool for FileList {
             .map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 let is_dir = e.path().is_dir();
-                let size = e.metadata().ok().filter(|m| !is_dir).map(|m| m.len());
+                let size = e.metadata().ok().filter(|_| !is_dir).map(|m| m.len());
                 json!({
                     "name": name,
                     "type": if is_dir { "dir" } else { "file" },

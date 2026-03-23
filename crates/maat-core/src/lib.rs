@@ -1,6 +1,8 @@
 //! Shared types for all MAAT crates.
 //! Pure data — no I/O, no side effects.
 
+pub mod commands;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -111,6 +113,14 @@ pub enum StopReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
+    /// Optional logical profile ID used by MAAT's model registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
+    /// Optional provider ID used by MAAT's model registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+
     /// Model ID as the provider expects.
     /// For OpenRouter use "provider/model", e.g. "minimax/minimax-m1".
     /// Override at runtime with the `MAAT_MODEL` env var.
@@ -132,6 +142,8 @@ impl ModelSpec {
     /// Set `OPENROUTER_API_KEY` for auth.
     pub fn openrouter_default() -> Self {
         Self {
+            profile_id: Some("default".to_string()),
+            provider_id: Some("openrouter".to_string()),
             model_id: std::env::var("MAAT_MODEL")
                 .unwrap_or_else(|_| "minimax/minimax-m1".to_string()),
             base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -140,6 +152,129 @@ impl ModelSpec {
             max_tokens: 4096,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProviderApiStyle {
+    OpenAiCompat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProviderSpec {
+    pub id: String,
+    pub api_style: ProviderApiStyle,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelCostTier {
+    Cheap,
+    Standard,
+    Premium,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelLatencyTier {
+    Fast,
+    Balanced,
+    Slow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelReasoningTier {
+    Light,
+    Medium,
+    Heavy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ModelTrait {
+    ToolCalling,
+    LongContext,
+    StructuredOutput,
+    Reasoning,
+    Vision,
+    FastResponse,
+    LowCost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub cost_tier: ModelCostTier,
+    pub latency_tier: ModelLatencyTier,
+    pub reasoning_tier: ModelReasoningTier,
+    pub context_window: u32,
+    pub supports_tool_calling: bool,
+    pub tags: Vec<String>,
+    pub traits: Vec<ModelTrait>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelSelectionPolicy {
+    /// Prefer these profiles first, in order.
+    #[serde(default)]
+    pub preferred_profiles: Vec<String>,
+    /// Explicit allow-list. Empty means "any profile is allowed".
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    /// Explicit deny-list.
+    #[serde(default)]
+    pub deny_profiles: Vec<String>,
+    /// Prefer profiles that advertise these traits.
+    #[serde(default)]
+    pub required_traits: Vec<ModelTrait>,
+    /// Upper bound for parsimony-sensitive routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_tier: Option<ModelCostTier>,
+    /// Upper bound for latency-sensitive routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_latency_tier: Option<ModelLatencyTier>,
+    /// Minimum reasoning tier for difficult routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_reasoning_tier: Option<ModelReasoningTier>,
+    /// Whether tool-capable models are required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_tool_calling: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModelRouteScope {
+    Global,
+    PharohPrimary,
+    SessionDefault,
+    SessionNamed(String),
+    Planner,
+    CapabilityNudge,
+    Summarizer,
+    Intent(String),
+    Capability(CapabilityId),
+    CapabilityTag(String),
+    Talent(String),
+    Skill(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRouteRule {
+    pub scope: ModelRouteScope,
+    pub policy: ModelSelectionPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityRoutingHints {
+    #[serde(default)]
+    pub preferred_tags: Vec<String>,
+    #[serde(default)]
+    pub avoids_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ModelSelectionPolicy>,
 }
 
 // ─────────────────────────────────────────────
@@ -292,10 +427,26 @@ pub enum ParsedCommand {
     StatusSession  { name: SessionName },
     WorkflowInspect { session: SessionName },
     TaskInspect     { step_id: StepId },
+    ModelList,
     ModelSwap { session: Option<SessionName>, model_id: String },
     Purge     { session: SessionName },
     /// List all registered tools/talents.
     ToolsList,
+    /// List installed local skills.
+    SkillsList,
+    /// Search ClawHub for skills matching a query.
+    SkillSearch { query: String },
+    /// Install a skill from a local directory into the workspace skills folder.
+    SkillInstall { source: String },
+    ArtifactsList,
+    ArtifactImport { path: String },
+    ArtifactShow { handle: String },
+    MemoryAdd { text: String },
+    MistakeAdd { text: String },
+    UserNoteAdd { user: Option<String>, text: String },
+    PersonaAppend { text: String },
+    PromptsList,
+    PromptShow { name: String },
     /// Show current config (no secret values).
     ConfigShow,
     /// Set a config value (key, value).
@@ -328,6 +479,8 @@ pub enum SessionPayload {
         text: String,
         context_excerpt: Vec<ChatMessage>,   // recent turns only, not full history
         model: ModelSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_policy: Option<ModelSelectionPolicy>,
     },
     /// Session reports its current summary back to PHAROH.
     SummaryUpdate { summary: String },
@@ -354,6 +507,8 @@ pub struct TaskSpec {
     pub description: String,
     pub messages: Vec<ChatMessage>,
     pub model: ModelSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_policy: Option<ModelSelectionPolicy>,
     /// IDs only — resolved from the process-global CapabilityRegistry.
     pub capability_refs: Vec<CapabilityId>,
     pub retry: RetryPolicy,
@@ -399,10 +554,23 @@ pub struct ResultEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskOutcome {
-    Success { content: String, tool_calls_made: Vec<ToolCallRecord> },
+    Success {
+        content: String,
+        tool_calls_made: Vec<ToolCallRecord>,
+        generated_artifacts: Vec<GeneratedArtifact>,
+    },
     Failed  { error: String, retryable: bool },
     Cancelled,
     TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedArtifact {
+    pub kind: String,
+    pub mime_type: String,
+    pub suggested_name: String,
+    pub summary: String,
+    pub data_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,7 +693,34 @@ pub struct CapabilityCard {
     pub output_schema: serde_json::Value,
     pub cost_profile: CostProfile,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub semantic_terms: Vec<String>,
+    #[serde(default)]
+    pub trust: CapabilityTrust,
+    #[serde(default)]
+    pub provenance: CapabilityProvenance,
     pub permissions: Vec<Permission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_hints: Option<CapabilityRoutingHints>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum CapabilityTrust {
+    Core,
+    Trusted,
+    Review,
+    #[default]
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CapabilityProvenance {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -607,7 +802,378 @@ pub struct PendingToolCall {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn llm_definition(&self) -> LlmToolDef;
+    fn capability_card(&self) -> Option<CapabilityCard> {
+        let def = self.llm_definition();
+        Some(CapabilityCard {
+            id: CapabilityId(def.name.clone()),
+            name: def.name.clone(),
+            semantic_description: def.description.clone(),
+            kind: CapabilityKind::Talent,
+            input_schema: def.parameters,
+            output_schema: serde_json::json!({ "type": "object" }),
+            cost_profile: CostProfile::default(),
+            tags: Vec::new(),
+            semantic_terms: Vec::new(),
+            trust: CapabilityTrust::Core,
+            provenance: CapabilityProvenance {
+                source: "compiled_talent".into(),
+                path: None,
+                reference: None,
+            },
+            permissions: Vec::new(),
+            routing_hints: None,
+        })
+    }
     async fn call(&self, input: serde_json::Value) -> Result<serde_json::Value, MaatError>;
+}
+
+#[derive(Default)]
+pub struct CapabilityRegistry {
+    cards: HashMap<CapabilityId, CapabilityCard>,
+}
+
+impl CapabilityRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn register(&mut self, card: CapabilityCard) {
+        let card = normalize_capability_card(card);
+        self.cards.insert(card.id.clone(), card);
+    }
+
+    pub fn get(&self, id: &CapabilityId) -> Option<&CapabilityCard> {
+        self.cards.get(id)
+    }
+
+    pub fn all(&self) -> Vec<CapabilityCard> {
+        self.cards.values().cloned().collect()
+    }
+
+    pub fn ids(&self) -> Vec<CapabilityId> {
+        self.cards.keys().cloned().collect()
+    }
+
+    pub fn ranked_for_text(&self, text: &str, limit: usize) -> Vec<(CapabilityCard, u32)> {
+        let query_terms = tokenize_terms(text);
+        let mut scored: Vec<(CapabilityCard, u32)> = self.cards
+            .values()
+            .cloned()
+            .map(|card| {
+                let score: u32 = card.semantic_terms
+                    .iter()
+                    .map(|term| u32::from(query_terms.contains(term)))
+                    .sum();
+                let weighted_score = score.saturating_mul(100) + capability_priority(&card);
+                (card, weighted_score)
+            })
+            .filter(|(_, score)| *score > 0)
+            .collect();
+
+        scored.sort_by(|(a_card, a_score), (b_card, b_score)| {
+            b_score.cmp(a_score).then_with(|| a_card.name.cmp(&b_card.name))
+        });
+        scored.truncate(limit);
+        scored
+    }
+
+    pub fn default_candidate_ids(&self) -> Vec<CapabilityId> {
+        let mut cards: Vec<_> = self.cards.values().cloned().collect();
+        cards.sort_by(|a, b| {
+            capability_priority(b)
+                .cmp(&capability_priority(a))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let safe: Vec<_> = cards
+            .iter()
+            .filter(|card| card.trust != CapabilityTrust::Untrusted)
+            .map(|card| card.id.clone())
+            .collect();
+        if safe.is_empty() {
+            cards.into_iter().map(|card| card.id).collect()
+        } else {
+            safe
+        }
+    }
+}
+
+pub struct ModelRegistry {
+    providers: HashMap<String, ModelProviderSpec>,
+    profiles: HashMap<String, ModelProfile>,
+    default_profile: Option<String>,
+}
+
+impl Default for ModelRegistry {
+    fn default() -> Self {
+        Self { providers: HashMap::new(), profiles: HashMap::new(), default_profile: None }
+    }
+}
+
+impl ModelRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn register_provider(&mut self, provider: ModelProviderSpec) {
+        self.providers.insert(provider.id.clone(), provider);
+    }
+
+    pub fn register_profile(&mut self, profile: ModelProfile) {
+        self.profiles.insert(profile.id.clone(), profile);
+    }
+
+    pub fn set_default_profile(&mut self, profile_id: impl Into<String>) {
+        self.default_profile = Some(profile_id.into());
+    }
+
+    pub fn default_profile(&self) -> Option<&ModelProfile> {
+        let id = self.default_profile.as_ref()?;
+        self.profiles.get(id)
+    }
+
+    pub fn profile(&self, profile_id: &str) -> Option<&ModelProfile> {
+        self.profiles.get(profile_id)
+    }
+
+    pub fn profiles(&self) -> Vec<&ModelProfile> {
+        let mut profiles: Vec<_> = self.profiles.values().collect();
+        profiles.sort_by(|a, b| a.id.cmp(&b.id));
+        profiles
+    }
+
+    pub fn resolve_spec(&self, profile_id: &str) -> Option<ModelSpec> {
+        let profile = self.profile(profile_id)?;
+        let provider = self.providers.get(&profile.provider_id)?;
+        Some(ModelSpec {
+            profile_id: Some(profile.id.clone()),
+            provider_id: Some(provider.id.clone()),
+            model_id: profile.model_id.clone(),
+            base_url: provider.base_url.clone(),
+            api_key_env: provider.api_key_env.clone(),
+            temperature: profile.temperature,
+            max_tokens: profile.max_tokens,
+        })
+    }
+
+    pub fn resolve_default_spec(&self) -> Option<ModelSpec> {
+        let profile = self.default_profile()?;
+        self.resolve_spec(&profile.id)
+    }
+
+    pub fn resolve_for_policies(
+        &self,
+        policies: &[ModelSelectionPolicy],
+        fallback_profile: Option<&str>,
+    ) -> Option<ModelSpec> {
+        let merged = policies.iter().fold(ModelSelectionPolicy::default(), |acc, policy| {
+            acc.merge(policy)
+        });
+
+        if let Some(profile_id) = merged
+            .preferred_profiles
+            .iter()
+            .find(|profile_id| self.profile_matches_policy(profile_id, &merged))
+        {
+            return self.resolve_spec(profile_id);
+        }
+
+        let mut candidates: Vec<&ModelProfile> = self
+            .profiles
+            .values()
+            .filter(|profile| self.profile_matches(profile, &merged))
+            .collect();
+
+        candidates.sort_by_key(|profile| {
+            (
+                profile.cost_tier,
+                profile.latency_tier,
+                profile.reasoning_tier,
+                profile.id.clone(),
+            )
+        });
+
+        candidates
+            .first()
+            .and_then(|profile| self.resolve_spec(&profile.id))
+            .or_else(|| fallback_profile.and_then(|profile_id| self.resolve_spec(profile_id)))
+            .or_else(|| self.resolve_default_spec())
+    }
+
+    fn profile_matches_policy(&self, profile_id: &str, policy: &ModelSelectionPolicy) -> bool {
+        self.profile(profile_id)
+            .map(|profile| self.profile_matches(profile, policy))
+            .unwrap_or(false)
+    }
+
+    fn profile_matches(&self, profile: &ModelProfile, policy: &ModelSelectionPolicy) -> bool {
+        if !policy.allow_profiles.is_empty() && !policy.allow_profiles.iter().any(|id| id == &profile.id) {
+            return false;
+        }
+        if policy.deny_profiles.iter().any(|id| id == &profile.id) {
+            return false;
+        }
+        if let Some(max_cost) = policy.max_cost_tier {
+            if profile.cost_tier > max_cost {
+                return false;
+            }
+        }
+        if let Some(max_latency) = policy.max_latency_tier {
+            if profile.latency_tier > max_latency {
+                return false;
+            }
+        }
+        if let Some(min_reasoning) = policy.min_reasoning_tier {
+            if profile.reasoning_tier < min_reasoning {
+                return false;
+            }
+        }
+        if policy.require_tool_calling == Some(true) && !profile.supports_tool_calling {
+            return false;
+        }
+        if !policy.required_traits.iter().all(|required| profile.traits.contains(required)) {
+            return false;
+        }
+        true
+    }
+}
+
+impl ModelSelectionPolicy {
+    pub fn merge(&self, overlay: &ModelSelectionPolicy) -> ModelSelectionPolicy {
+        ModelSelectionPolicy {
+            preferred_profiles: merge_unique(&overlay.preferred_profiles, &self.preferred_profiles),
+            allow_profiles: intersect_or_inherit(&self.allow_profiles, &overlay.allow_profiles),
+            deny_profiles: merge_unique(&self.deny_profiles, &overlay.deny_profiles),
+            required_traits: merge_unique(&self.required_traits, &overlay.required_traits),
+            max_cost_tier: more_restrictive_min(self.max_cost_tier, overlay.max_cost_tier),
+            max_latency_tier: more_restrictive_min(self.max_latency_tier, overlay.max_latency_tier),
+            min_reasoning_tier: more_restrictive_max(self.min_reasoning_tier, overlay.min_reasoning_tier),
+            require_tool_calling: match (self.require_tool_calling, overlay.require_tool_calling) {
+                (Some(a), Some(b)) => Some(a || b),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            },
+        }
+    }
+}
+
+fn merge_unique<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
+    let mut merged = Vec::new();
+    for item in a.iter().chain(b.iter()) {
+        if !merged.contains(item) {
+            merged.push(item.clone());
+        }
+    }
+    merged
+}
+
+fn intersect_or_inherit<T: Clone + PartialEq>(base: &[T], overlay: &[T]) -> Vec<T> {
+    match (base.is_empty(), overlay.is_empty()) {
+        (true, true) => Vec::new(),
+        (true, false) => overlay.to_vec(),
+        (false, true) => base.to_vec(),
+        (false, false) => base
+            .iter()
+            .filter(|item| overlay.contains(item))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn more_restrictive_min<T: Copy + Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn more_restrictive_max<T: Copy + Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn normalize_capability_card(mut card: CapabilityCard) -> CapabilityCard {
+    let mut terms = tokenize_terms(&card.name);
+    terms.extend(tokenize_terms(&card.semantic_description));
+    for tag in &card.tags {
+        terms.extend(tokenize_terms(tag));
+    }
+    terms.extend(schema_terms(&card.input_schema));
+    terms.extend(schema_terms(&card.output_schema));
+    for permission in &card.permissions {
+        terms.extend(tokenize_terms(&format!("{permission:?}")));
+    }
+    terms.extend(tokenize_terms(&format!("{:?}", card.trust)));
+    terms.extend(tokenize_terms(&card.provenance.source));
+    if let Some(path) = &card.provenance.path {
+        terms.extend(tokenize_terms(path));
+    }
+    if let Some(reference) = &card.provenance.reference {
+        terms.extend(tokenize_terms(reference));
+    }
+    if let Some(hints) = &card.routing_hints {
+        for tag in &hints.preferred_tags {
+            terms.extend(tokenize_terms(tag));
+        }
+    }
+
+    terms.sort();
+    terms.dedup();
+
+    if card.tags.is_empty() {
+        card.tags = infer_tags(&terms);
+    }
+    card.semantic_terms = terms;
+    card
+}
+
+fn schema_terms(schema: &serde_json::Value) -> Vec<String> {
+    let mut terms = Vec::new();
+    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (name, value) in properties {
+            terms.extend(tokenize_terms(name));
+            if let Some(description) = value.get("description").and_then(|d| d.as_str()) {
+                terms.extend(tokenize_terms(description));
+            }
+        }
+    }
+    terms
+}
+
+fn infer_tags(terms: &[String]) -> Vec<String> {
+    let known_tags = [
+        "email", "calendar", "filesystem", "search", "web", "read", "write", "code",
+        "browse", "analysis",
+    ];
+    known_tags
+        .iter()
+        .filter(|tag| terms.iter().any(|term| term == *tag))
+        .map(|tag| (*tag).to_string())
+        .collect()
+}
+
+fn capability_priority(card: &CapabilityCard) -> u32 {
+    let trust_bonus = match card.trust {
+        CapabilityTrust::Core => 60,
+        CapabilityTrust::Trusted => 40,
+        CapabilityTrust::Review => 20,
+        CapabilityTrust::Untrusted => 5,
+    };
+    let kind_bonus = match card.kind {
+        CapabilityKind::Talent => 20,
+        CapabilityKind::Skill(_) => 10,
+        CapabilityKind::Workspace(_) => 15,
+    };
+    trust_bonus + kind_bonus
+}
+
+fn tokenize_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| part.len() >= 3)
+        .collect()
 }
 
 // ─────────────────────────────────────────────
@@ -634,6 +1200,22 @@ impl ToolRegistry {
 
     pub fn all_definitions(&self) -> Vec<LlmToolDef> {
         self.tools.values().map(|t| t.llm_definition()).collect()
+    }
+
+    pub fn definitions_for_names(&self, names: &[String]) -> Vec<LlmToolDef> {
+        names.iter()
+            .filter_map(|name| self.tools.get(name).map(|tool| tool.llm_definition()))
+            .collect()
+    }
+
+    pub fn capability_registry(&self) -> CapabilityRegistry {
+        let mut registry = CapabilityRegistry::new();
+        for tool in self.tools.values() {
+            if let Some(card) = tool.capability_card() {
+                registry.register(card);
+            }
+        }
+        registry
     }
 
     pub fn is_empty(&self) -> bool { self.tools.is_empty() }

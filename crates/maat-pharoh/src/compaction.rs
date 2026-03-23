@@ -18,6 +18,7 @@ use tracing::{info, warn};
 pub async fn compact(
     messages: &[ChatMessage],
     session_id: &str,
+    prompt: &str,
     llm: &dyn LlmClient,
     store: &dyn MemoryStore,
 ) -> Result<ContextPointer, MaatError> {
@@ -39,12 +40,7 @@ pub async fn compact(
         .join("\n");
 
     let summary_messages = vec![
-        ChatMessage::system(
-            "You are a concise summariser. \
-             Summarise the conversation below, preserving key facts, decisions, \
-             user preferences, and any important context. Be brief — aim for \
-             3-6 sentences. Do not editorialize.",
-        ),
+        ChatMessage::system(prompt),
         ChatMessage::user(transcript),
     ];
 
@@ -61,8 +57,8 @@ pub async fn compact(
         created_at_ms: now,
     };
 
-    store.save_context_pointer(&ptr)?;
-    if let Err(e) = store.mark_compacted_count(session_id, messages.len()) {
+    store.save_context_pointer(&ptr).await?;
+    if let Err(e) = store.mark_compacted_count(session_id, messages.len()).await {
         warn!(session = %session_id, error = %e, "failed to mark messages compacted in DB");
     }
 

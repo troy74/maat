@@ -1,0 +1,11 @@
+id = "pdf"
+name = "pdf"
+trust = "trusted"
+permissions = ["file_read", "file_write", "process_spawn"]
+source_kind = "workspace"
+reference = "openai/skills:skills/.curated/pdf"
+
+[execution]
+mode = "command"
+command = "cargo"
+args = ["run", "--quiet", "--manifest-path", "../../Cargo.toml", "-p", "maat-pdf-cli", "--"]

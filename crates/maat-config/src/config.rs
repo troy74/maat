@@ -1,7 +1,7 @@
 //! Structured configuration — maat.toml + maat.workspace.toml.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::BTreeMap;
 use tracing::{info, warn};
 
 // ─────────────────────────────────────────────
@@ -31,6 +31,10 @@ pub struct MaatConfig {
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
+    pub prompts: PromptConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
     pub imap: Option<ImapConfig>,
     #[serde(default)]
     pub google: Option<GoogleConfig>,
@@ -40,14 +44,22 @@ pub struct MaatConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    /// Legacy single-model config. Still supported as the bootstrap default.
     #[serde(default = "LlmConfig::default_model")]
     pub model: String,
+    /// Legacy single-provider base URL. Still supported as the bootstrap default.
     #[serde(default = "LlmConfig::default_base_url")]
     pub base_url: String,
     #[serde(default = "LlmConfig::default_token_budget")]
     pub token_budget: u32,
     #[serde(default = "LlmConfig::default_compaction_threshold")]
     pub compaction_threshold: u32,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ModelProviderConfig>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ModelProfileConfig>,
+    #[serde(default)]
+    pub routing: ModelRoutingConfig,
 }
 
 impl Default for LlmConfig {
@@ -57,6 +69,9 @@ impl Default for LlmConfig {
             base_url: Self::default_base_url(),
             token_budget: Self::default_token_budget(),
             compaction_threshold: Self::default_compaction_threshold(),
+            providers: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            routing: ModelRoutingConfig::default(),
         }
     }
 }
@@ -66,6 +81,64 @@ impl LlmConfig {
     fn default_base_url() -> String { "https://openrouter.ai/api/v1".into() }
     fn default_token_budget() -> u32 { 50_000 }
     fn default_compaction_threshold() -> u32 { 40_000 }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProviderConfig {
+    pub api_style: String,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileConfig {
+    pub provider: String,
+    pub model_id: String,
+    #[serde(default = "ModelProfileConfig::default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "ModelProfileConfig::default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl ModelProfileConfig {
+    fn default_temperature() -> f32 { 0.7 }
+    fn default_max_tokens() -> u32 { 4096 }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelRoutingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pharoh_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_nudge_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_default_profile: Option<String>,
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    #[serde(default)]
+    pub deny_profiles: Vec<String>,
+    #[serde(default)]
+    pub routes: BTreeMap<String, ModelRouteConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelRouteConfig {
+    #[serde(default)]
+    pub prefer_profiles: Vec<String>,
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    #[serde(default)]
+    pub deny_profiles: Vec<String>,
+    #[serde(default)]
+    pub required_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +155,38 @@ impl Default for MemoryConfig {
 
 impl MemoryConfig {
     fn default_db_path() -> String { "maat.db".into() }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptConfig {
+    #[serde(default = "PromptConfig::default_dir")]
+    pub dir: String,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self { dir: Self::default_dir() }
+    }
+}
+
+impl PromptConfig {
+    fn default_dir() -> String { "prompts".into() }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default = "SkillsConfig::default_dirs")]
+    pub dirs: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self { dirs: Self::default_dirs() }
+    }
+}
+
+impl SkillsConfig {
+    fn default_dirs() -> Vec<String> { vec!["skills".into()] }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -156,9 +261,31 @@ impl MaatConfig {
             format!("  base_url           = {}", self.llm.base_url),
             format!("  token_budget       = {}", self.llm.token_budget),
             format!("  compaction_threshold = {}", self.llm.compaction_threshold),
+            format!("  providers          = {}", self.llm.providers.len()),
+            format!("  profiles           = {}", self.llm.profiles.len()),
             format!("[memory]"),
             format!("  db_path            = {}", self.memory.db_path),
+            format!("[prompts]"),
+            format!("  dir                = {}", self.prompts.dir),
+            format!("[skills]"),
+            format!("  dirs               = {}", self.skills.dirs.join(", ")),
         ];
+        if let Some(default_profile) = &self.llm.routing.default_profile {
+            lines.push("[llm.routing]".into());
+            lines.push(format!("  default_profile = {default_profile}"));
+            if let Some(pharoh) = &self.llm.routing.pharoh_profile {
+                lines.push(format!("  pharoh_profile  = {pharoh}"));
+            }
+            if let Some(planner) = &self.llm.routing.planner_profile {
+                lines.push(format!("  planner_profile = {planner}"));
+            }
+            if let Some(capability_nudge) = &self.llm.routing.capability_nudge_profile {
+                lines.push(format!("  capability_nudge_profile = {capability_nudge}"));
+            }
+            if let Some(session_default) = &self.llm.routing.session_default_profile {
+                lines.push(format!("  session_default_profile = {session_default}"));
+            }
+        }
         if let Some(imap) = &self.imap {
             lines.push("[imap]".into());
             if let Some(h) = &imap.host     { lines.push(format!("  host     = {h}")); }
@@ -221,14 +348,6 @@ fn load_from_dirs(filename: &str, dirs: &[std::path::PathBuf]) -> Result<toml::V
     }
     info!(filename, "config file not found in any search dir");
     Ok(toml::Value::Table(toml::map::Map::new()))
-}
-
-fn load_file(path: &str) -> Result<toml::Value, ConfigError> {
-    if !Path::new(path).exists() {
-        return Ok(toml::Value::Table(toml::map::Map::new()));
-    }
-    let text = std::fs::read_to_string(path)?;
-    toml::from_str(&text).map_err(|e| ConfigError::Parse { file: path.into(), source: e })
 }
 
 /// Deep-merge: workspace values override base values.

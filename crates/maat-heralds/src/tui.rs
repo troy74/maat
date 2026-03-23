@@ -20,6 +20,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
+use maat_core::commands::{command_specs, complete_command, CommandCompletionContext};
 use maat_core::{
     ChatMessage, ChatReply, HeraldPayload, ParsedCommand, Role, SessionName, TokenUsage,
     TuiEvent,
@@ -50,6 +51,14 @@ struct App {
     // Stats from the last completed turn.
     last_usage: Option<TokenUsage>,
     last_latency_ms: Option<u64>,
+    last_total_lines: usize,
+    last_visible_h: usize,
+    active_session: Option<String>,
+    completion_matches: Vec<String>,
+    completion_index: usize,
+    known_sessions: Vec<String>,
+    known_models: Vec<String>,
+    known_prompts: Vec<String>,
 }
 
 impl App {
@@ -64,6 +73,25 @@ impl App {
             auto_scroll: true,
             last_usage: None,
             last_latency_ms: None,
+            last_total_lines: 0,
+            last_visible_h: 0,
+            active_session: None,
+            completion_matches: Vec::new(),
+            completion_index: 0,
+            known_sessions: Vec::new(),
+            known_models: vec!["default".into()],
+            known_prompts: vec![
+                "primary_system".into(),
+                "named_session".into(),
+                "compaction".into(),
+                "capability_nudge".into(),
+                "identity".into(),
+                "persona".into(),
+                "rules".into(),
+                "memory".into(),
+                "mistakes".into(),
+                "users/default".into(),
+            ],
         }
     }
 
@@ -80,8 +108,8 @@ impl App {
         self.auto_scroll = false;
     }
 
-    fn scroll_down(&mut self, n: usize, total_lines: usize, visible_h: usize) {
-        let max = total_lines.saturating_sub(visible_h);
+    fn scroll_down(&mut self, n: usize) {
+        let max = self.last_total_lines.saturating_sub(self.last_visible_h);
         self.scroll_offset = (self.scroll_offset + n).min(max);
         if self.scroll_offset >= max {
             self.auto_scroll = true;
@@ -90,6 +118,11 @@ impl App {
 
     fn snap_to_bottom(&mut self, total_lines: usize, visible_h: usize) {
         self.scroll_offset = total_lines.saturating_sub(visible_h);
+    }
+
+    fn reset_completion(&mut self) {
+        self.completion_matches.clear();
+        self.completion_index = 0;
     }
 }
 
@@ -145,55 +178,60 @@ async fn event_loop(
                         // Send message
                         KeyCode::Enter if !app.input.is_empty() => {
                             let text = std::mem::take(&mut app.input);
+                            app.reset_completion();
 
                             if text.trim() == "/help" {
                                 app.messages.push(ChatMessage {
                                     role: Role::System,
                                     tool_call_id: None,
                                     tool_calls_json: None,
-                                    content: concat!(
-                                        "Commands\n",
-                                        "  /help                          — this message\n",
-                                        "  /tools  or  /talents           — list loaded tools/talents\n",
-                                        "  /config                        — show current config\n",
-                                        "  /config set <key> <value>      — update a config value\n",
-                                        "  /secret list                   — list known secret keys\n",
-                                        "  /secret set <key> <value>      — store a secret\n",
-                                        "  /secret delete <key>           — remove a secret\n",
-                                        "  /auth google                   — start Google OAuth flow\n",
-                                        "  /session new <name>: <desc>    — create named session\n",
-                                        "  /session list                  — list sessions + summaries\n",
-                                        "  /session end <name>            — end a named session\n",
-                                        "  /status                        — show PHAROH status\n",
-                                        "  @<name>: <message>             — route to named session\n",
-                                        "  PageUp/Down  ↑/↓              — scroll\n",
-                                        "  Ctrl+C                         — quit",
-                                    ).into(),
+                                    content: render_command_help().into(),
                                 });
                             } else {
-                                let payload = parse_input(text.clone());
-                                app.messages.push(ChatMessage::user(&text));
-                                app.status = "Thinking…".into();
-                                let _ = tx.send(payload).await;
+                                match handle_local_input(&mut app, text.clone()) {
+                                    LocalInput::Handled(message) => {
+                                        app.messages.push(ChatMessage {
+                                            role: Role::System,
+                                            tool_call_id: None,
+                                            tool_calls_json: None,
+                                            content: message,
+                                        });
+                                    }
+                                    LocalInput::Send(payload) => {
+                                        remember_command_side_effects(&mut app, &payload);
+                                        app.messages.push(ChatMessage::user(&text));
+                                        app.status = "Thinking…".into();
+                                        let _ = tx.send(payload).await;
+                                    }
+                                }
                             }
                         }
 
                         // Backspace
-                        KeyCode::Backspace => { app.input.pop(); }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                            app.reset_completion();
+                        }
 
                         // Scroll
                         KeyCode::PageUp   => app.scroll_up(10),
                         KeyCode::PageDown => {
-                            // we need total_lines; compute lazily with a sentinel
-                            app.scroll_down(10, usize::MAX, 0);
+                            app.scroll_down(10);
                         }
                         KeyCode::Up   => app.scroll_up(1),
                         KeyCode::Down => {
-                            app.scroll_down(1, usize::MAX, 0);
+                            app.scroll_down(1);
                         }
 
                         // Typing
-                        KeyCode::Char(c) => app.input.push(c),
+                        KeyCode::Tab => {
+                            autocomplete_input(&mut app);
+                        }
+
+                        KeyCode::Char(c) => {
+                            app.input.push(c);
+                            app.reset_completion();
+                        }
 
                         _ => {}
                     }
@@ -234,6 +272,8 @@ fn render(f: &mut Frame, app: &mut App) {
 
     let total_lines = all_lines.len();
     let inner_h = msg_area.height.saturating_sub(2) as usize;
+    app.last_total_lines = total_lines;
+    app.last_visible_h = inner_h;
 
     // Apply auto-scroll before computing the visible slice.
     if app.auto_scroll {
@@ -262,20 +302,24 @@ fn render(f: &mut Frame, app: &mut App) {
 
     // ── input ──────────────────────────────────────────────────────
     let inner_w_input = input_area.width.saturating_sub(2) as usize;
-    let display_input = if app.input.len() > inner_w_input {
-        &app.input[app.input.len() - inner_w_input..]
+    let input_len = app.input.chars().count();
+    let display_input = if input_len > inner_w_input {
+        app.input
+            .chars()
+            .skip(input_len.saturating_sub(inner_w_input))
+            .collect::<String>()
     } else {
-        app.input.as_str()
+        app.input.clone()
     };
 
-    let input_widget = Paragraph::new(display_input).block(
+    let input_widget = Paragraph::new(display_input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" Message  (Enter: send) "),
     );
     f.render_widget(input_widget, input_area);
 
-    let cursor_x = input_area.x + 1 + display_input.len() as u16;
+    let cursor_x = input_area.x + 1 + display_input.chars().count() as u16;
     let cursor_y = input_area.y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 
@@ -287,7 +331,11 @@ fn render(f: &mut Frame, app: &mut App) {
         ),
         _ => format!(" model: {}", app.model_id),
     };
-    let status_line = format!("{:<width$} │{}", app.status, stats, width = 20);
+    let route = match &app.active_session {
+        Some(session) => format!(" │ route:@{}", session),
+        None => String::new(),
+    };
+    let status_line = format!("{:<width$} │{}{}", app.status, stats, route, width = 20);
     let status = Paragraph::new(status_line)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(status, status_area);
@@ -297,7 +345,7 @@ fn render(f: &mut Frame, app: &mut App) {
 // Message → styled lines
 // ─────────────────────────────────────────────
 
-fn message_to_lines(msg: &ChatMessage, _width: usize) -> Vec<Line<'static>> {
+fn message_to_lines(msg: &ChatMessage, width: usize) -> Vec<Line<'static>> {
     let (label, color) = match msg.role {
         Role::User      => ("You ", Color::Cyan),
         Role::Assistant => ("MAAT", Color::Green),
@@ -314,7 +362,9 @@ fn message_to_lines(msg: &ChatMessage, _width: usize) -> Vec<Line<'static>> {
 
     // Render content through the markdown parser.
     let content_lines = render_markdown(&msg.content);
-    lines.extend(content_lines);
+    for line in content_lines {
+        lines.extend(wrap_line(line, width));
+    }
 
     // Blank separator between messages.
     lines.push(Line::from(""));
@@ -401,8 +451,33 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
 // Command parsing
 // ─────────────────────────────────────────────
 
+enum LocalInput {
+    Handled(String),
+    Send(HeraldPayload),
+}
+
+/// Parse raw user input into a local action or a HeraldPayload.
+fn handle_local_input(app: &mut App, text: String) -> LocalInput {
+    let trimmed = text.trim();
+
+    if let Some(rest) = trimmed.strip_prefix("/session use ") {
+        let name = rest.trim();
+        if !name.is_empty() {
+            app.active_session = Some(name.to_string());
+            return LocalInput::Handled(format!("Active session set to @{}.", name));
+        }
+    }
+
+    if trimmed == "/session leave" {
+        app.active_session = None;
+        return LocalInput::Handled("Cleared active session target.".into());
+    }
+
+    LocalInput::Send(parse_input(text, app.active_session.as_deref()))
+}
+
 /// Parse raw user input into a HeraldPayload, recognising `@name:` and `/session` syntax.
-fn parse_input(text: String) -> HeraldPayload {
+fn parse_input(text: String, active_session: Option<&str>) -> HeraldPayload {
     let t = text.trim();
 
     // @name: message  →  route to named session
@@ -434,7 +509,7 @@ fn parse_input(text: String) -> HeraldPayload {
     }
 
     // /session list
-    if t == "/session list" {
+    if t == "/session list" || t == "/sessions" {
         return HeraldPayload::Command(ParsedCommand::SessionList);
     }
 
@@ -452,10 +527,136 @@ fn parse_input(text: String) -> HeraldPayload {
     if t == "/status" {
         return HeraldPayload::Command(ParsedCommand::StatusAll);
     }
+    if let Some(rest) = t.strip_prefix("/status ") {
+        let name = rest.trim();
+        if !name.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::StatusSession {
+                name: SessionName(name.to_string()),
+            });
+        }
+    }
+
+    if t == "/models" || t == "/model list" {
+        return HeraldPayload::Command(ParsedCommand::ModelList);
+    }
+    if let Some(rest) = t.strip_prefix("/model set ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        match parts.as_slice() {
+            [model_id] => {
+                return HeraldPayload::Command(ParsedCommand::ModelSwap {
+                    session: None,
+                    model_id: (*model_id).to_string(),
+                });
+            }
+            [session, model_id] => {
+                return HeraldPayload::Command(ParsedCommand::ModelSwap {
+                    session: Some(SessionName((*session).trim_start_matches('@').to_string())),
+                    model_id: (*model_id).to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(rest) = t.strip_prefix("/purge ") {
+        let session = rest.trim();
+        if !session.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::Purge {
+                session: SessionName(session.to_string()),
+            });
+        }
+    }
 
     // /tools  or  /talents
     if t == "/tools" || t == "/talents" {
         return HeraldPayload::Command(ParsedCommand::ToolsList);
+    }
+
+    // /skills
+    if t == "/skills" {
+        return HeraldPayload::Command(ParsedCommand::SkillsList);
+    }
+    if let Some(rest) = t.strip_prefix("/skills search ") {
+        let query = rest.trim();
+        if !query.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::SkillSearch {
+                query: query.to_string(),
+            });
+        }
+    }
+    if let Some(rest) = t.strip_prefix("/skills install ") {
+        let source = rest.trim();
+        if !source.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::SkillInstall {
+                source: source.to_string(),
+            });
+        }
+    }
+
+    if t == "/artifacts" {
+        return HeraldPayload::Command(ParsedCommand::ArtifactsList);
+    }
+    if let Some(rest) = t.strip_prefix("/artifacts import ") {
+        let path = rest.trim();
+        if !path.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::ArtifactImport {
+                path: path.to_string(),
+            });
+        }
+    }
+    if let Some(rest) = t.strip_prefix("/artifacts show ") {
+        let handle = rest.trim();
+        if !handle.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::ArtifactShow {
+                handle: handle.to_string(),
+            });
+        }
+    }
+
+    if let Some(rest) = t.strip_prefix("/memory add ") {
+        let text = rest.trim();
+        if !text.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::MemoryAdd {
+                text: text.to_string(),
+            });
+        }
+    }
+    if let Some(rest) = t.strip_prefix("/mistake add ") {
+        let text = rest.trim();
+        if !text.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::MistakeAdd {
+                text: text.to_string(),
+            });
+        }
+    }
+    if let Some(rest) = t.strip_prefix("/user note add ") {
+        let text = rest.trim();
+        if !text.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::UserNoteAdd {
+                user: None,
+                text: text.to_string(),
+            });
+        }
+    }
+    if let Some(rest) = t.strip_prefix("/persona append ") {
+        let text = rest.trim();
+        if !text.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::PersonaAppend {
+                text: text.to_string(),
+            });
+        }
+    }
+
+    if t == "/prompts" {
+        return HeraldPayload::Command(ParsedCommand::PromptsList);
+    }
+    if let Some(rest) = t.strip_prefix("/prompts show ") {
+        let name = rest.trim();
+        if !name.is_empty() {
+            return HeraldPayload::Command(ParsedCommand::PromptShow {
+                name: name.to_string(),
+            });
+        }
     }
 
     // /config
@@ -494,7 +695,110 @@ fn parse_input(text: String) -> HeraldPayload {
         return HeraldPayload::Command(ParsedCommand::AuthGoogle);
     }
 
+    if let Some(session) = active_session {
+        if !t.starts_with('/') {
+            return HeraldPayload::Command(ParsedCommand::RouteToSession {
+                name: SessionName(session.to_string()),
+                message: text,
+            });
+        }
+    }
+
     HeraldPayload::Text(text)
+}
+
+fn autocomplete_input(app: &mut App) {
+    if !app.input.starts_with('/') {
+        return;
+    }
+
+    let prefix = app.input.clone();
+    let ctx = CommandCompletionContext {
+        sessions: app.known_sessions.clone(),
+        model_ids: app.known_models.clone(),
+        prompt_names: app.known_prompts.clone(),
+    };
+    let matches = complete_command(&prefix, &ctx);
+
+    if matches.is_empty() {
+        app.status = "No command matches".into();
+        return;
+    }
+
+    if app.completion_matches != matches {
+        app.completion_matches = matches;
+        app.completion_index = 0;
+    } else if app.completion_matches.len() > 1 {
+        app.completion_index = (app.completion_index + 1) % app.completion_matches.len();
+    }
+
+    let common = common_prefix(&app.completion_matches);
+    if common.len() > app.input.len() {
+        app.input = common;
+    } else {
+        app.input = app.completion_matches[app.completion_index].to_string();
+    }
+
+    if app.completion_matches.len() > 1 {
+        app.status = format!("Commands: {}", app.completion_matches.join("  "));
+    } else {
+        app.status = format!("Command: {}", app.input);
+    }
+}
+
+fn remember_command_side_effects(app: &mut App, payload: &HeraldPayload) {
+    if let HeraldPayload::Command(cmd) = payload {
+        match cmd {
+            ParsedCommand::SessionNew { name, .. }
+            | ParsedCommand::SessionEnd { name }
+            | ParsedCommand::StatusSession { name }
+            | ParsedCommand::Purge { session: name } => {
+                remember_value(&mut app.known_sessions, &name.0);
+            }
+            ParsedCommand::RouteToSession { name, .. } => {
+                remember_value(&mut app.known_sessions, &name.0);
+            }
+            ParsedCommand::ModelSwap { model_id, .. } => {
+                remember_value(&mut app.known_models, model_id);
+            }
+            ParsedCommand::PromptShow { name } => {
+                remember_value(&mut app.known_prompts, name);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn remember_value(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+        values.sort();
+    }
+}
+
+fn render_command_help() -> String {
+    let mut lines = vec!["Commands".to_string()];
+    for spec in command_specs() {
+        lines.push(format!("  {:<30} — {}", spec.template, spec.description));
+    }
+    lines.push("  @<name>: <message>             — route to named session".into());
+    lines.push("  Tab                            — autocomplete slash commands".into());
+    lines.push("  PageUp/Down  ↑/↓              — scroll".into());
+    lines.push("  Ctrl+C                         — quit".into());
+    lines.join("\n")
+}
+
+fn common_prefix(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut prefix = items[0].to_string();
+    for item in items.iter().skip(1) {
+        while !item.starts_with(&prefix) && !prefix.is_empty() {
+            prefix.pop();
+        }
+    }
+    prefix
 }
 
 /// Parse a single line for inline `**bold**` and `` `code` `` markers.
@@ -552,4 +856,101 @@ fn parse_inline(text: &str) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for span in line.spans {
+        let content = span.content.to_string();
+        let chars: Vec<char> = content.chars().collect();
+        let mut idx = 0usize;
+
+        while idx < chars.len() {
+            if current_width == width {
+                wrapped.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+
+            let remaining = width.saturating_sub(current_width);
+            let take = remaining.min(chars.len() - idx);
+            let chunk: String = chars[idx..idx + take].iter().collect();
+            current.push(Span::styled(chunk, span.style));
+            current_width += take;
+            idx += take;
+
+            if current_width == width {
+                wrapped.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+        }
+    }
+
+    if current.is_empty() {
+        wrapped.push(Line::from(""));
+    } else {
+        wrapped.push(Line::from(current));
+    }
+
+    wrapped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_line_splits_long_content_into_visual_lines() {
+        let wrapped = wrap_line(Line::from("abcdefghij"), 4);
+        let rendered: Vec<String> = wrapped
+            .into_iter()
+            .map(|line| line.spans.iter().map(|span| span.content.to_string()).collect())
+            .collect();
+
+        assert_eq!(rendered, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn auto_scroll_uses_wrapped_visual_line_count() {
+        let mut app = App::new("test-model".into());
+        app.messages.push(ChatMessage::assistant("abcdefghij"));
+        app.auto_scroll = true;
+
+        let all_lines: Vec<Line<'static>> = app
+            .messages
+            .iter()
+            .flat_map(|m| message_to_lines(m, 4))
+            .collect();
+
+        let total_lines = all_lines.len();
+        app.snap_to_bottom(total_lines, 3);
+
+        assert!(app.scroll_offset > 0, "scroll should move to show wrapped tail");
+    }
+
+    #[test]
+    fn active_session_routes_plain_text_to_named_session() {
+        let payload = parse_input("hello".into(), Some("coding"));
+        match payload {
+            HeraldPayload::Command(ParsedCommand::RouteToSession { name, message }) => {
+                assert_eq!(name.0, "coding");
+                assert_eq!(message, "hello");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autocomplete_extends_common_command_prefix() {
+        let mut app = App::new("test-model".into());
+        app.input = "/sk".into();
+        autocomplete_input(&mut app);
+        assert_eq!(app.input, "/skills");
+    }
 }

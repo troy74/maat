@@ -13,6 +13,12 @@ maat.workspace.toml
 # Logs
 *.log
 
+# Generated artifacts / local outputs
+/artifacts/
+/output/
+/tmp/
+maat_memory_notes.txt
+
 # Local tool/editor state
 .claude/
 

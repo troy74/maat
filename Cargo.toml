@@ -10,6 +10,7 @@ members = [
     "crates/maat-memory",
     "crates/maat-config",
     "crates/maat-ra",
+    "crates/maat-pdf-cli",
 ]
 resolver = "2"
 

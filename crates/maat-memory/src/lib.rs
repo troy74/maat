@@ -8,6 +8,7 @@
 pub mod sqlite;
 pub mod window;
 
+use async_trait::async_trait;
 use maat_core::{ChatMessage, MaatError, Role, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -101,19 +102,90 @@ impl ContextPointer {
 }
 
 // ─────────────────────────────────────────────
+// ArtifactRecord
+// ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub artifact_id: String,
+    pub handle: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub display_name: String,
+    pub storage_path: String,
+    pub byte_size: u64,
+    pub source: String,
+    pub summary: String,
+    pub metadata_json: String,
+    pub analysis_json: String,
+    pub created_at_ms: u64,
+}
+
+impl ArtifactRecord {
+    pub fn pointer_text(&self) -> String {
+        format!(
+            "[ARTIFACT {}] {} ({}, {}, {})",
+            self.handle, self.summary, self.kind, self.mime_type, self.display_name
+        )
+    }
+}
+
+// ─────────────────────────────────────────────
 // MemoryStore trait
 // ─────────────────────────────────────────────
 
+#[async_trait]
 pub trait MemoryStore: Send + Sync {
-    fn save_session_meta(&self, meta: &SessionMeta) -> Result<(), MaatError>;
+    async fn save_session_meta(&self, meta: &SessionMeta) -> Result<(), MaatError>;
     fn load_session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>, MaatError>;
-    fn save_message(&self, msg: &StoredMessage) -> Result<(), MaatError>;
-    fn load_history(&self, session_id: &str) -> Result<Vec<StoredMessage>, MaatError>;
-    fn save_context_pointer(&self, ptr: &ContextPointer) -> Result<(), MaatError>;
-    fn load_context_pointers(&self, session_id: &str) -> Result<Vec<ContextPointer>, MaatError>;
-    fn mark_compacted(&self, session_id: &str, before_ms: u64) -> Result<(), MaatError>;
+    async fn load_session_meta_by_user_and_name(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<Option<SessionMeta>, MaatError>;
+    async fn save_message(&self, msg: &StoredMessage) -> Result<(), MaatError>;
+    async fn load_history(&self, session_id: &str) -> Result<Vec<StoredMessage>, MaatError>;
+    async fn save_context_pointer(&self, ptr: &ContextPointer) -> Result<(), MaatError>;
+    async fn load_context_pointers(&self, session_id: &str) -> Result<Vec<ContextPointer>, MaatError>;
+    async fn import_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        source_path: &std::path::Path,
+    ) -> Result<ArtifactRecord, MaatError>;
+    async fn save_generated_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        display_name: &str,
+        kind: &str,
+        mime_type: &str,
+        source: &str,
+        summary: &str,
+        metadata_json: &str,
+        analysis_json: &str,
+        bytes: &[u8],
+    ) -> Result<ArtifactRecord, MaatError>;
+    async fn list_artifacts(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ArtifactRecord>, MaatError>;
+    async fn get_artifact_by_handle(
+        &self,
+        user_id: &str,
+        handle: &str,
+    ) -> Result<Option<ArtifactRecord>, MaatError>;
+    async fn latest_session_artifact(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ArtifactRecord>, MaatError>;
+    async fn mark_compacted(&self, session_id: &str, before_ms: u64) -> Result<(), MaatError>;
     /// Mark the oldest `count` uncompacted messages in a session as compacted.
-    fn mark_compacted_count(&self, session_id: &str, count: usize) -> Result<(), MaatError>;
+    async fn mark_compacted_count(&self, session_id: &str, count: usize) -> Result<(), MaatError>;
+    async fn purge_session(&self, session_id: &str) -> Result<(), MaatError>;
 }
 
 // ─────────────────────────────────────────────
@@ -143,5 +215,11 @@ impl Default for ContextConfig {
             token_budget: 50_000,
             compaction_threshold: 40_000,
         }
+    }
+}
+
+impl ContextConfig {
+    pub fn new(token_budget: u32, compaction_threshold: u32) -> Self {
+        Self { token_budget, compaction_threshold }
     }
 }

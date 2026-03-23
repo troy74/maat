@@ -1367,11 +1367,15 @@ name = "maat-config"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "base64 0.22.1",
  "keyring",
+ "maat-core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
+ "tokio",
  "toml",
  "tracing",
 ]
@@ -1408,6 +1412,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "maat-core",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",
@@ -1417,6 +1422,7 @@ dependencies = [
 name = "maat-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "maat-core",
  "rusqlite",
  "serde",
@@ -1441,9 +1447,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "maat-pdf-cli"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "maat-pharoh"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "kameo",
  "maat-config",
  "maat-core",
@@ -1451,6 +1466,7 @@ dependencies = [
  "maat-memory",
  "maat-talents",
  "maat-vizier",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -1476,6 +1492,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]
@@ -1502,10 +1519,13 @@ name = "maat-vizier"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "kameo",
  "maat-core",
  "maat-llm",
  "maat-minions",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -2311,6 +2331,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2905,6 +2938,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
