@@ -1,0 +1,25 @@
+[package]
+name    = "maat-ra"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "maat"
+path = "src/main.rs"
+
+[dependencies]
+maat-core    = { path = "../maat-core" }
+maat-llm     = { path = "../maat-llm" }
+maat-vizier  = { path = "../maat-vizier" }
+maat-pharoh  = { path = "../maat-pharoh" }
+maat-heralds = { path = "../maat-heralds" }
+maat-talents = { path = "../maat-talents" }
+maat-memory  = { path = "../maat-memory" }
+maat-config  = { path = "../maat-config" }
+dotenvy      = { workspace = true }
+kameo        = { workspace = true }
+tokio        = { workspace = true }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender   = { workspace = true }

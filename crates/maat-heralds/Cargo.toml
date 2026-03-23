@@ -1,0 +1,13 @@
+[package]
+name    = "maat-heralds"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maat-core  = { path = "../maat-core" }
+tokio      = { workspace = true }
+ratatui    = { workspace = true }
+crossterm  = { workspace = true }
+futures    = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }

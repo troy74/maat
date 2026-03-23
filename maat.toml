@@ -1,0 +1,32 @@
+# MAAT configuration — safe to commit (no secrets here).
+# For local overrides, use maat.workspace.toml (gitignored).
+
+[llm]
+# model = "openai/gpt-5-mini"
+model = "x-ai/grok-4.20-beta"
+base_url = "https://openrouter.ai/api/v1"
+
+[memory]
+db_path = "maat.db"
+
+# Uncomment and fill in to enable IMAP email reading.
+# Credentials go in maat.workspace.toml or via /secret set.
+#
+# [imap]
+# host     = "imap.gmail.com"
+# port     = 993
+# username = "you@gmail.com"
+# # password is looked up via secret key (default: maat/imap/password)
+
+# Uncomment and fill in to enable Google OAuth (gmail_send etc).
+# Client secret goes in secret store, not here.
+#
+[google]
+client_id = "739895888671-bu5purfiblr49rrqmhcda7dkqb0uaef5.apps.googleusercontent.com"
+
+[secrets]
+# Uncomment to use 1Password as the primary secret store.
+# onepassword_vault = "MAAT"
+#
+# Uncomment to use an encrypted file as fallback (useful on headless servers).
+# encrypted_file_path = "maat.secrets.enc"

@@ -1,0 +1,17 @@
+[package]
+name    = "maat-pharoh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maat-core    = { path = "../maat-core" }
+maat-llm     = { path = "../maat-llm" }
+maat-vizier  = { path = "../maat-vizier" }
+maat-memory  = { path = "../maat-memory" }
+maat-config  = { path = "../maat-config" }
+maat-talents = { path = "../maat-talents" }
+kameo       = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+ulid        = { workspace = true }
+toml        = { workspace = true }

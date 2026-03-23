@@ -1,0 +1,20 @@
+# Build output
+/target/
+
+# Credentials — never commit
+.env
+
+# Local app state
+*.db
+*.db-shm
+*.db-wal
+maat.workspace.toml
+
+# Logs
+*.log
+
+# Local tool/editor state
+.claude/
+
+# macOS
+.DS_Store

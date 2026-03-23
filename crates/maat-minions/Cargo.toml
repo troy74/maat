@@ -1,0 +1,13 @@
+[package]
+name    = "maat-minions"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maat-core   = { path = "../maat-core" }
+maat-llm    = { path = "../maat-llm" }
+kameo       = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+anyhow      = { workspace = true }
+serde_json  = { workspace = true }

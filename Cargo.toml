@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/maat-core",
+    "crates/maat-llm",
+    "crates/maat-minions",
+    "crates/maat-vizier",
+    "crates/maat-pharoh",
+    "crates/maat-heralds",
+    "crates/maat-talents",
+    "crates/maat-memory",
+    "crates/maat-config",
+    "crates/maat-ra",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# async runtime
+tokio         = { version = "1",    features = ["full"] }
+# serialisation
+serde         = { version = "1",    features = ["derive"] }
+serde_json    = "1"
+# error handling
+thiserror     = "1"
+anyhow        = "1"
+# async traits
+async-trait   = "0.1"
+# unique ids
+ulid          = { version = "1", features = ["serde"] }
+# actors
+kameo         = "0.13"
+# llm
+async-openai  = "0.27"
+# streams
+futures       = "0.3"
+# tui
+ratatui       = "0.29"
+crossterm     = { version = "0.28", features = ["event-stream"] }
+# logging
+tracing               = "0.1"
+tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
+tracing-appender      = "0.2"
+# env file
+dotenvy       = "0.15"
+# config
+toml          = "0.8"
+# secrets
+keyring       = { version = "3", features = ["apple-native", "sync-secret-service"] }
+aes-gcm       = "0.10"
+base64        = "0.22"
+# sqlite
+rusqlite      = { version = "0.31", features = ["bundled"] }
+# imap
+imap          = "2"
+native-tls    = "0.2"
+mailparse     = "0.14"
+# http client (google apis, oauth)
+reqwest       = { version = "0.12", features = ["json"] }
+# datetime (calendar, token expiry)
+chrono        = { version = "0.4", features = ["serde"] }

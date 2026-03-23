@@ -1,0 +1,19 @@
+[package]
+name    = "maat-talents"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maat-core   = { path = "../maat-core" }
+maat-config = { path = "../maat-config" }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+async-trait = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+imap        = { workspace = true }
+native-tls  = { workspace = true }
+mailparse   = { workspace = true }
+reqwest     = { workspace = true }
+base64      = { workspace = true }
+chrono      = { workspace = true }
