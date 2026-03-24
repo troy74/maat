@@ -5,9 +5,14 @@ edition = "2021"
 
 [dependencies]
 maat-core  = { path = "../maat-core" }
+maat-config = { path = "../maat-config" }
+maat-memory = { path = "../maat-memory" }
 tokio      = { workspace = true }
 ratatui    = { workspace = true }
 crossterm  = { workspace = true }
 futures    = { workspace = true }
 anyhow     = { workspace = true }
 tracing    = { workspace = true }
+reqwest    = { workspace = true, features = ["multipart"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }

@@ -35,9 +35,15 @@ pub struct MaatConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
+    pub automations: AutomationsConfig,
+    #[serde(default)]
     pub imap: Option<ImapConfig>,
     #[serde(default)]
     pub google: Option<GoogleConfig>,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub users: UsersConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
 }
@@ -114,6 +120,8 @@ pub struct ModelRoutingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pharoh_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_classifier_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_nudge_profile: Option<String>,
@@ -125,6 +133,8 @@ pub struct ModelRoutingConfig {
     pub deny_profiles: Vec<String>,
     #[serde(default)]
     pub routes: BTreeMap<String, ModelRouteConfig>,
+    #[serde(default)]
+    pub support_rules: Vec<SupportCapabilityRuleConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -139,6 +149,14 @@ pub struct ModelRouteConfig {
     pub required_tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SupportCapabilityRuleConfig {
+    #[serde(default)]
+    pub match_any_terms: Vec<String>,
+    #[serde(default)]
+    pub capability_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +207,28 @@ impl SkillsConfig {
     fn default_dirs() -> Vec<String> { vec!["skills".into()] }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationsConfig {
+    #[serde(default = "AutomationsConfig::default_dir")]
+    pub dir: String,
+    #[serde(default = "AutomationsConfig::default_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+impl Default for AutomationsConfig {
+    fn default() -> Self {
+        Self {
+            dir: Self::default_dir(),
+            poll_seconds: Self::default_poll_seconds(),
+        }
+    }
+}
+
+impl AutomationsConfig {
+    fn default_dir() -> String { "automations".into() }
+    fn default_poll_seconds() -> u64 { 30 }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImapConfig {
     pub host: Option<String>,
@@ -223,6 +263,48 @@ impl GoogleConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub bot_token_secret: Option<String>,
+    pub bot_token_env: Option<String>,
+    pub default_chat_id: Option<i64>,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
+    #[serde(default = "TelegramConfig::default_poll_seconds")]
+    pub poll_seconds: u64,
+    #[serde(default = "TelegramConfig::default_download_dir")]
+    pub download_dir: String,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_secret: None,
+            bot_token_env: None,
+            default_chat_id: None,
+            allowed_chat_ids: Vec::new(),
+            poll_seconds: Self::default_poll_seconds(),
+            download_dir: Self::default_download_dir(),
+        }
+    }
+}
+
+impl TelegramConfig {
+    fn default_poll_seconds() -> u64 { 10 }
+    fn default_download_dir() -> String { "tmp/telegram".into() }
+
+    pub fn token_key(&self) -> &str {
+        self.bot_token_secret.as_deref().unwrap_or("maat/telegram/bot_token")
+    }
+
+    pub fn token_env(&self) -> &str {
+        self.bot_token_env.as_deref().unwrap_or("TELEGRAM_BOT_TOKEN")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecretsConfig {
     /// 1Password vault name. If set, 1Password CLI is tried first.
@@ -230,6 +312,61 @@ pub struct SecretsConfig {
     /// Path to encrypted secrets file (headless fallback).
     /// Defaults to `maat.secrets.enc` in the working directory.
     pub encrypted_file_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UsersConfig {
+    #[serde(default)]
+    pub principals: BTreeMap<String, PrincipalConfig>,
+    #[serde(default)]
+    pub telegram: Vec<TelegramIdentityConfig>,
+}
+
+impl UsersConfig {
+    pub fn has_telegram_identities(&self) -> bool {
+        !self.telegram.is_empty()
+    }
+
+    pub fn resolve_telegram_identity(
+        &self,
+        telegram_user_id: i64,
+        chat_id: i64,
+    ) -> Option<&TelegramIdentityConfig> {
+        self.telegram.iter().find(|identity| {
+            identity.user_id == telegram_user_id
+                && (identity.allowed_chat_ids.is_empty()
+                    || identity.allowed_chat_ids.iter().any(|allowed| *allowed == chat_id))
+        })
+    }
+
+    pub fn principal_display_name<'a>(&'a self, principal_id: &'a str) -> &'a str {
+        self.principals
+            .get(principal_id)
+            .and_then(|principal| principal.display_name.as_deref())
+            .unwrap_or(principal_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PrincipalConfig {
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelegramIdentityConfig {
+    pub principal: String,
+    pub user_id: i64,
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
+    #[serde(default = "TelegramIdentityConfig::default_can_instruct")]
+    pub can_instruct: bool,
+}
+
+impl TelegramIdentityConfig {
+    fn default_can_instruct() -> bool { true }
 }
 
 // ─────────────────────────────────────────────
@@ -299,9 +436,35 @@ impl MaatConfig {
             lines.push(format!("  client_secret → secret:{}", g.client_secret_key()));
             lines.push(format!("  oauth_token   → secret:{}", g.token_key()));
         }
+        if self.telegram.enabled {
+            lines.push("[telegram]".into());
+            lines.push("  enabled = true".into());
+            lines.push(format!("  bot_token → secret:{}", self.telegram.token_key()));
+            lines.push(format!("  poll_seconds = {}", self.telegram.poll_seconds));
+            lines.push(format!("  download_dir = {}", self.telegram.download_dir));
+            if let Some(chat_id) = self.telegram.default_chat_id {
+                lines.push(format!("  default_chat_id = {}", chat_id));
+            }
+            if !self.telegram.allowed_chat_ids.is_empty() {
+                lines.push(format!(
+                    "  allowed_chat_ids = {}",
+                    self.telegram
+                        .allowed_chat_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
         if let Some(vault) = &self.secrets.onepassword_vault {
             lines.push(format!("[secrets]"));
             lines.push(format!("  1password_vault = {vault}"));
+        }
+        if !self.users.principals.is_empty() || !self.users.telegram.is_empty() {
+            lines.push("[users]".into());
+            lines.push(format!("  principals = {}", self.users.principals.len()));
+            lines.push(format!("  telegram_identities = {}", self.users.telegram.len()));
         }
         lines.join("\n")
     }

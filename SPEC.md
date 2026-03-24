@@ -3,6 +3,15 @@
 > *Ma'at: the ancient Egyptian concept of truth, balance, and cosmic order.*
 > A Rust framework for orchestrating multi-user, multi-model, recursive AI agent sessions.
 
+This spec now serves two jobs:
+- describe the target architecture
+- record the transitional decisions already shaping the codebase
+
+Current truth:
+- MAAT is no longer just a clean session-tree sketch
+- it already has artifacts, automations, heralds, prompt-driven routing, installed skills, identity-gated Telegram ingress, and background runs
+- the next phase is therefore about smoothing overlap and improving recovery, not inventing the first architecture from scratch
+
 ---
 
 ## Overview
@@ -16,6 +25,85 @@ MAAT is a Rust-based agent harness built around a clear three-tier session model
 3. **MINIONs** — ephemeral workers spawned by a VIZIER. Each executes a bounded task (LLM call ± tool calls) then terminates. Assigned a specific model and a resolved set of capabilities from the **Capability Registry**.
 
 Tools, skills, and workspace integrations are described by **Capability Cards** — structured records that VIZIER uses to match workflow steps to available capabilities at runtime.
+
+Current runtime truth:
+- PHAROH also contains a few pragmatic fast paths for direct answers and narrow direct invocation cases
+- VIZIER is partly heuristic and partly prompt-driven
+- installed skills are both semantic capabilities and executable tools
+- artifacts and runs are now first-class durable references with human-readable handles
+
+That is useful progress, but it means overlap resolution should now be treated as a first-class subsystem.
+
+---
+
+## Transitional Decisions
+
+### 1. Explicit invocation should beat soft inference
+
+Once the runtime contains:
+- models
+- skills
+- artifacts
+- channels
+- automations
+
+natural language alone is not always a sufficient control surface.
+
+When the user is clearly naming a skill, model, artifact, or run, MAAT should have a stable explicit invocation layer rather than hoping semantic routing infers the same thing every time.
+
+The exact syntax is still open. Good candidates include:
+- qualifier-style references
+- slash-command subcommands
+- inline handles with autocomplete support
+
+The important design choice is not the syntax itself. It is that explicit invocation should be recognized before soft intent routing.
+
+### 2. Routing should be layered
+
+The desired routing order is:
+1. explicit invocation detection
+2. prompt-driven intent classification
+3. capability shortlist or nudge
+4. final model resolution under hard policy
+5. execution and recovery
+
+This is better than pure keyword routing, pure prompt routing, or pure deterministic overrides.
+
+### 3. Skills need cleaner runtime contracts
+
+Installed skills should converge on:
+- structured inputs
+- structured outputs
+- explicit artifact-in and artifact-out support
+- explicit execution metadata
+
+This is especially important for local deterministic tools such as image rectification, OCR, or scanning pipelines that do not need an LLM generation step.
+
+### 4. Autonomy requires self-healing
+
+The system should increasingly recover from routine failures itself, including:
+- unloaded but installable skills
+- stale local paths
+- missing output directories
+- artifact-handle resolution mistakes
+- route/model mismatches
+
+That does not mean hiding errors. It means:
+- detect
+- retry or repair if safe
+- explain what happened
+- surface the remaining hard blocker if recovery failed
+
+### 5. Communication policy must become principal-aware
+
+Inbound Telegram sender registration is already a deterministic gate.
+The next extension of the spec is outbound policy:
+- who can trigger external sends
+- to which recipients
+- through which channels
+- when approval is required
+
+That is a runtime authorization concern, not a prompt concern.
 
 ---
 

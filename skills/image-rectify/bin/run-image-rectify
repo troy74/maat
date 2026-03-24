@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_JSON="${MAAT_SKILL_INPUT:-{}}"
+WORKSPACE_DIR="${MAAT_WORKSPACE_DIR:-$(pwd)}"
+
+REQUEST_PATH="$(python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("MAAT_SKILL_INPUT", "{}")
+try:
+    data = json.loads(raw)
+except Exception:
+    data = {}
+value = (data.get("input_path") or data.get("request") or "").strip()
+print(value)
+PY
+)"
+
+OUTPUT_PATH="$(python3 - <<'PY'
+import json, os, sys
+raw = os.environ.get("MAAT_SKILL_INPUT", "{}")
+try:
+    data = json.loads(raw)
+except Exception:
+    data = {}
+value = (data.get("output_path") or "").strip()
+print(value)
+PY
+)"
+
+if [ -z "$REQUEST_PATH" ]; then
+  echo '{"message":"missing input image path in request","ok":false}'
+  exit 1
+fi
+
+if [ ! -f "$REQUEST_PATH" ]; then
+  case "$REQUEST_PATH" in
+    /*) ;;
+    *) REQUEST_PATH="${WORKSPACE_DIR%/}/$REQUEST_PATH" ;;
+  esac
+fi
+
+if [ ! -f "$REQUEST_PATH" ]; then
+  echo "{\"message\":\"input image not found: $REQUEST_PATH\",\"ok\":false}"
+  exit 1
+fi
+
+if [ -z "$OUTPUT_PATH" ]; then
+  BASENAME="$(basename "$REQUEST_PATH")"
+  STEM="${BASENAME%.*}"
+  OUTPUT_PATH="${WORKSPACE_DIR%/}/output/image-rectify/${STEM}-rectified.jpg"
+else
+  case "$OUTPUT_PATH" in
+    /*) ;;
+    *) OUTPUT_PATH="${WORKSPACE_DIR%/}/$OUTPUT_PATH" ;;
+  esac
+fi
+
+mkdir -p "$(dirname "$OUTPUT_PATH")"
+
+"$(pwd)/bin/page-scanner" \
+  "$REQUEST_PATH" \
+  --model "$(pwd)/models/seg-model.onnx" \
+  --format img \
+  --cleanimg crisp \
+  --output "$OUTPUT_PATH"
+
+printf '{"ok":true,"output_path":"%s","input_path":"%s","message":"rectified image written"}\n' \
+  "$OUTPUT_PATH" \
+  "$REQUEST_PATH"

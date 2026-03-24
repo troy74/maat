@@ -1,0 +1,10 @@
+id = "daily-summary"
+name = "Daily Summary"
+prompt = "Summarize the most important updates in this workspace and call out anything that needs attention."
+status = "paused"
+session = "automation"
+
+[schedule]
+kind = "daily"
+hour = 9
+minute = 0

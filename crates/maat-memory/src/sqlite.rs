@@ -13,7 +13,10 @@ use maat_core::MaatError;
 use rusqlite::{params, Connection};
 use tokio::task;
 
-use crate::{ArtifactRecord, ContextPointer, MemoryStore, SessionMeta, StoredMessage};
+use crate::{
+    ArtifactRecord, AutomationRunRecord, BackgroundRunRecord, ContextPointer, MemoryStore,
+    SessionMeta, StoredMessage,
+};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -96,6 +99,35 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_user_created ON artifacts(user_id, created_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_session_created ON artifacts(session_id, created_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+    run_id             TEXT PRIMARY KEY,
+    automation_id      TEXT NOT NULL,
+    automation_name    TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    started_at_ms      INTEGER NOT NULL,
+    finished_at_ms     INTEGER NOT NULL,
+    summary            TEXT NOT NULL,
+    error              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_id_started ON automation_runs(automation_id, started_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS background_runs (
+    run_id              TEXT PRIMARY KEY,
+    handle              TEXT NOT NULL UNIQUE,
+    user_id             TEXT NOT NULL,
+    parent_session_id   TEXT NOT NULL,
+    session_name        TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    prompt              TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    summary             TEXT NOT NULL,
+    error               TEXT,
+    created_at_ms       INTEGER NOT NULL,
+    started_at_ms       INTEGER NOT NULL,
+    finished_at_ms      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_background_runs_user_created ON background_runs(user_id, created_at_ms DESC);
 ";
 
 #[async_trait]
@@ -586,6 +618,186 @@ impl MemoryStore for SqliteStore {
         .await
     }
 
+    async fn save_automation_run(&self, run: &AutomationRunRecord) -> Result<(), MaatError> {
+        let conn = self.conn.clone();
+        let run = run.clone();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO automation_runs
+                 (run_id, automation_id, automation_name, status, started_at_ms, finished_at_ms, summary, error)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    run.run_id,
+                    run.automation_id,
+                    run.automation_name,
+                    run.status,
+                    run.started_at_ms as i64,
+                    run.finished_at_ms as i64,
+                    run.summary,
+                    run.error,
+                ],
+            )
+            .map_err(|e| MaatError::Storage(format!("save automation run: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn latest_automation_run(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<AutomationRunRecord>, MaatError> {
+        let conn = self.conn.clone();
+        let automation_id = automation_id.to_string();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, automation_id, automation_name, status, started_at_ms, finished_at_ms, summary, error
+                     FROM automation_runs
+                     WHERE automation_id = ?1
+                     ORDER BY started_at_ms DESC
+                     LIMIT 1",
+                )
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![automation_id], row_to_automation_run)
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            match rows.next() {
+                Some(Ok(run)) => Ok(Some(run)),
+                Some(Err(e)) => Err(MaatError::Storage(e.to_string())),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn list_automation_runs(
+        &self,
+        automation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationRunRecord>, MaatError> {
+        let conn = self.conn.clone();
+        let automation_id = automation_id.to_string();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, automation_id, automation_name, status, started_at_ms, finished_at_ms, summary, error
+                     FROM automation_runs
+                     WHERE automation_id = ?1
+                     ORDER BY started_at_ms DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![automation_id, limit as i64], row_to_automation_run)
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            rows.map(|r| r.map_err(|e| MaatError::Storage(e.to_string())))
+                .collect()
+        })
+        .await
+    }
+
+    async fn save_background_run(&self, run: &BackgroundRunRecord) -> Result<(), MaatError> {
+        let conn = self.conn.clone();
+        let run = run.clone();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO background_runs
+                 (run_id, handle, user_id, parent_session_id, session_name, title, prompt, status, summary, error, created_at_ms, started_at_ms, finished_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    run.run_id,
+                    run.handle,
+                    run.user_id,
+                    run.parent_session_id,
+                    run.session_name,
+                    run.title,
+                    run.prompt,
+                    background_run_status_text(&run.status),
+                    run.summary,
+                    run.error,
+                    run.created_at_ms as i64,
+                    run.started_at_ms as i64,
+                    run.finished_at_ms.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e| MaatError::Storage(format!("save background run: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_background_run_by_handle(
+        &self,
+        user_id: &str,
+        handle: &str,
+    ) -> Result<Option<BackgroundRunRecord>, MaatError> {
+        let conn = self.conn.clone();
+        let user_id = user_id.to_string();
+        let handle = handle.to_string();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, handle, user_id, parent_session_id, session_name, title, prompt, status, summary, error, created_at_ms, started_at_ms, finished_at_ms
+                     FROM background_runs
+                     WHERE user_id = ?1 AND handle = ?2
+                     LIMIT 1",
+                )
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![user_id, handle], row_to_background_run)
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            match rows.next() {
+                Some(Ok(run)) => Ok(Some(run)),
+                Some(Err(e)) => Err(MaatError::Storage(e.to_string())),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn list_background_runs(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackgroundRunRecord>, MaatError> {
+        let conn = self.conn.clone();
+        let user_id = user_id.to_string();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, handle, user_id, parent_session_id, session_name, title, prompt, status, summary, error, created_at_ms, started_at_ms, finished_at_ms
+                     FROM background_runs
+                     WHERE user_id = ?1
+                     ORDER BY created_at_ms DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![user_id, limit as i64], row_to_background_run)
+                .map_err(|e| MaatError::Storage(e.to_string()))?;
+            rows.map(|r| r.map_err(|e| MaatError::Storage(e.to_string())))
+                .collect()
+        })
+        .await
+    }
+
+    async fn allocate_background_run_handle(&self, title: &str) -> Result<String, MaatError> {
+        let conn = self.conn.clone();
+        let title = title.to_string();
+        run_db(move || {
+            let conn = lock(&conn)?;
+            next_background_run_handle(&conn, &title)
+        })
+        .await
+    }
+
     async fn mark_compacted(&self, session_id: &str, before_ms: u64) -> Result<(), MaatError> {
         let conn = self.conn.clone();
         let session_id = session_id.to_string();
@@ -663,6 +875,37 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> 
     })
 }
 
+fn row_to_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRecord> {
+    Ok(AutomationRunRecord {
+        run_id: row.get(0)?,
+        automation_id: row.get(1)?,
+        automation_name: row.get(2)?,
+        status: row.get(3)?,
+        started_at_ms: row.get::<_, i64>(4)? as u64,
+        finished_at_ms: row.get::<_, i64>(5)? as u64,
+        summary: row.get(6)?,
+        error: row.get(7)?,
+    })
+}
+
+fn row_to_background_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundRunRecord> {
+    Ok(BackgroundRunRecord {
+        run_id: row.get(0)?,
+        handle: row.get(1)?,
+        user_id: row.get(2)?,
+        parent_session_id: row.get(3)?,
+        session_name: row.get(4)?,
+        title: row.get(5)?,
+        prompt: row.get(6)?,
+        status: parse_background_run_status(&row.get::<_, String>(7)?),
+        summary: row.get(8)?,
+        error: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        started_at_ms: row.get(11)?,
+        finished_at_ms: row.get(12)?,
+    })
+}
+
 fn infer_artifact_kind(file_name: &str) -> String {
     match file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" => "image".into(),
@@ -705,6 +948,25 @@ fn next_artifact_handle(conn: &Connection, kind: &str, file_name: &str) -> Resul
     Err(MaatError::Storage("failed to allocate unique artifact handle".into()))
 }
 
+pub fn next_background_run_handle(conn: &Connection, title: &str) -> Result<String, MaatError> {
+    let words = artifact_words("run", title);
+    for suffix_index in 0..256u32 {
+        let suffix = short_code(suffix_index);
+        let candidate = format!("{}-{}-{suffix}", words.0, words.1);
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM background_runs WHERE handle = ?1",
+                params![candidate],
+                |row| row.get(0),
+            )
+            .map_err(|e| MaatError::Storage(format!("background run handle lookup: {e}")))?;
+        if exists == 0 {
+            return Ok(candidate);
+        }
+    }
+    Err(MaatError::Storage("failed to allocate unique background run handle".into()))
+}
+
 fn artifact_words(kind: &str, file_name: &str) -> (String, String) {
     let tokens = file_name
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -738,7 +1000,28 @@ fn default_second_word(kind: &str) -> &'static str {
         "image" => "canvas",
         "pdf" => "ledger",
         "document" => "brief",
+        "run" => "thread",
         _ => "record",
+    }
+}
+
+fn background_run_status_text(status: &maat_core::BackgroundRunStatus) -> &'static str {
+    match status {
+        maat_core::BackgroundRunStatus::Queued => "queued",
+        maat_core::BackgroundRunStatus::Running => "running",
+        maat_core::BackgroundRunStatus::Completed => "completed",
+        maat_core::BackgroundRunStatus::Failed => "failed",
+        maat_core::BackgroundRunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_background_run_status(value: &str) -> maat_core::BackgroundRunStatus {
+    match value {
+        "queued" => maat_core::BackgroundRunStatus::Queued,
+        "running" => maat_core::BackgroundRunStatus::Running,
+        "completed" => maat_core::BackgroundRunStatus::Completed,
+        "cancelled" => maat_core::BackgroundRunStatus::Cancelled,
+        _ => maat_core::BackgroundRunStatus::Failed,
     }
 }
 

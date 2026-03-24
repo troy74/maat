@@ -1,0 +1,10 @@
+id = "daily-breaking-news-telegram"
+name = "Daily breaking news telegram"
+prompt = "Every day at 14:10, use Tavily/current web search to find the latest breaking news. Summarize the most important developments clearly and concisely, prioritizing recent, noteworthy, and widely relevant stories. Send the result as a Telegram message to +393517188154."
+status = "active"
+session = "automation"
+
+[schedule]
+kind = "daily"
+hour = 14
+minute = 10

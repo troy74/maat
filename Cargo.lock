@@ -1369,6 +1369,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64 0.22.1",
+ "chrono",
  "keyring",
  "maat-core",
  "serde",
@@ -1399,8 +1400,13 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures",
+ "maat-config",
  "maat-core",
+ "maat-memory",
  "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -1411,6 +1417,7 @@ version = "0.1.0"
 dependencies = [
  "async-openai",
  "async-trait",
+ "base64 0.22.1",
  "maat-core",
  "reqwest",
  "serde_json",
@@ -1441,6 +1448,7 @@ dependencies = [
  "kameo",
  "maat-core",
  "maat-llm",
+ "maat-memory",
  "serde_json",
  "tokio",
  "tracing",
@@ -1523,11 +1531,13 @@ dependencies = [
  "kameo",
  "maat-core",
  "maat-llm",
+ "maat-memory",
  "maat-minions",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

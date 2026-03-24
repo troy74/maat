@@ -12,13 +12,15 @@ use std::time::Duration;
 
 use kameo::{request::MessageSend, Actor};
 use maat_core::{
-    CapabilityId, CapabilityKind, CapabilityRegistry, CapabilityTrust, ChatMessage,
+    CancellationRegistry, CapabilityId, CapabilityKind, CapabilityRegistry, CapabilityTrust, ChatMessage,
     ComponentAddress, EnvelopeHeader, MaatError, ModelRegistry, ModelRouteRule, ModelRouteScope,
     ModelSelectionPolicy, ModelSpec, Priority, ResourceBudget, ResultEnvelope, RetryPolicy,
-    Permission, Role, SessionId, StatusEvent, StatusKind, StepId, StepState, TaskEnvelope,
+    Permission, Role, SessionId, StatusEvent, StatusKind, StepId, StepState,
+    SupportCapabilityRule, TaskEnvelope,
     TaskOutcome, TaskSpec, TraceId, ToolRegistry, UserId, WorkflowId, WorkflowState,
 };
 use maat_llm::{LlmClient, OpenAiCompatClient};
+use maat_memory::MemoryStore;
 use maat_minions::{Minion, RunTask};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -35,8 +37,12 @@ pub struct Vizier {
     capability_registry: Arc<CapabilityRegistry>,
     model_registry: Arc<ModelRegistry>,
     route_rules: Arc<Vec<ModelRouteRule>>,
+    store: Arc<dyn MemoryStore>,
+    support_rules: Arc<Vec<SupportCapabilityRule>>,
+    intent_classifier_prompt: String,
     capability_nudge_prompt: String,
     status_tx: broadcast::Sender<StatusEvent>,
+    cancel_registry: CancellationRegistry,
 }
 
 impl Vizier {
@@ -48,8 +54,12 @@ impl Vizier {
         capability_registry: Arc<CapabilityRegistry>,
         model_registry: Arc<ModelRegistry>,
         route_rules: Arc<Vec<ModelRouteRule>>,
+        store: Arc<dyn MemoryStore>,
+        support_rules: Arc<Vec<SupportCapabilityRule>>,
+        intent_classifier_prompt: String,
         capability_nudge_prompt: String,
         status_tx: broadcast::Sender<StatusEvent>,
+        cancel_registry: CancellationRegistry,
     ) -> Self {
         Self {
             user_id,
@@ -58,8 +68,12 @@ impl Vizier {
             capability_registry,
             model_registry,
             route_rules,
+            store,
+            support_rules,
+            intent_classifier_prompt,
             capability_nudge_prompt,
             status_tx,
+            cancel_registry,
         }
     }
 
@@ -89,6 +103,7 @@ pub struct VizierTask {
     pub retry: RetryPolicy,
     /// Absolute unix-ms deadline; None = use MINION default (120s).
     pub deadline_ms: Option<u64>,
+    pub cancel_key: Option<String>,
 }
 
 pub struct Dispatch(pub VizierTask);
@@ -111,10 +126,17 @@ impl kameo::message::Message<Dispatch> for Vizier {
             "vizier dispatching single-step workflow"
         );
 
-        let capability_refs = self
-            .select_capability_refs(&task.description, &task.messages, &task.model)
+        let intent_scope = self
+            .classify_intent_scope(&task.description, &task.messages, &task.model)
             .await;
-        let intent_scope = detect_intent_scope(&task.description);
+        let capability_refs = self
+            .select_capability_refs(
+                &task.description,
+                &task.messages,
+                &task.model,
+                intent_scope.as_ref(),
+            )
+            .await;
         let (talent_count, skill_count) = capability_refs
             .iter()
             .filter_map(|capability_id| self.capability_registry.get(capability_id))
@@ -124,10 +146,15 @@ impl kameo::message::Message<Dispatch> for Vizier {
                 CapabilityKind::Workspace(_) => (talents, skills),
             });
 
+        let effective_model_policy = merge_task_policy_with_message_requirements(
+            task.model_policy.as_ref(),
+            &task.messages,
+        );
+
         let selected_model = self.resolve_model(
             &task.route_scope,
             intent_scope.as_ref(),
-            task.model_policy.as_ref(),
+            effective_model_policy.as_ref(),
             &capability_refs,
             &task.model,
         );
@@ -172,8 +199,9 @@ impl kameo::message::Message<Dispatch> for Vizier {
                 description: task.description,
                 messages: trim_messages_for_intent(&task.messages, intent_scope.as_ref()),
                 model: selected_model.clone(),
-                model_policy: task.model_policy.clone(),
+                model_policy: effective_model_policy.clone(),
                 capability_refs,
+                cancel_key: task.cancel_key.clone(),
                 retry: task.retry.clone(),
                 allow_sub_vizier: false,
             },
@@ -218,10 +246,11 @@ impl Vizier {
         description: &str,
         messages: &[ChatMessage],
         fallback_model: &ModelSpec,
+        intent_scope: Option<&ModelRouteScope>,
     ) -> Vec<CapabilityId> {
         let query_text = capability_query_text(description, messages);
         if matches!(
-            detect_intent_scope(description),
+            intent_scope,
             Some(ModelRouteScope::Intent(ref name))
                 if name == "image_generate" || name == "image_edit"
         ) {
@@ -282,23 +311,15 @@ impl Vizier {
         let mut support = Vec::new();
         let query_lower = query_text.to_ascii_lowercase();
 
-        if text_has_any(&query_lower, &["mail", "email", "send", "attach", "attachment"]) {
-            maybe_push_capability(&mut support, self.find_capability_by_id("gmail_send"));
-        }
-        if text_has_any(
-            &query_lower,
-            &["write", "save", "create", "draft", "generate", "export", "pdf", "attachment"],
-        ) {
-            maybe_push_capability(&mut support, self.find_capability_by_id("file_write"));
-        }
-        if text_has_any(
-            &query_lower,
-            &["read", "review", "inspect", "check", "open", "input", "source", "attachment"],
-        ) {
-            maybe_push_capability(&mut support, self.find_capability_by_id("file_read"));
-        }
-        if text_has_any(&query_lower, &["list", "browse", "folder", "directory", "files"]) {
-            maybe_push_capability(&mut support, self.find_capability_by_id("file_list"));
+        for rule in self.support_rules.iter() {
+            if text_has_any_terms(&query_lower, &rule.match_any_terms) {
+                for capability_id in &rule.capability_ids {
+                    maybe_push_capability(
+                        &mut support,
+                        self.find_capability_by_id(&capability_id.0),
+                    );
+                }
+            }
         }
 
         for capability_id in selected {
@@ -355,6 +376,69 @@ impl Vizier {
         let close_scores = top.saturating_sub(second) <= 25;
         let multiple_meaningful = ranked.iter().take(4).filter(|(_, score)| *score > 0).count() >= 2;
         close_scores || multiple_meaningful
+    }
+
+    async fn classify_intent_scope(
+        &self,
+        description: &str,
+        messages: &[ChatMessage],
+        fallback_model: &ModelSpec,
+    ) -> Option<ModelRouteScope> {
+        if self.explicit_skill_mention(description) {
+            return None;
+        }
+        let classifier_model = self.resolve_model(
+            &ModelRouteScope::IntentClassifier,
+            None,
+            None,
+            &[],
+            fallback_model,
+        );
+        let llm = OpenAiCompatClient::from_spec(&classifier_model).ok()?;
+        let recent_context = intent_context_excerpt(messages);
+        let prompt = format!(
+            "{}\n\nReturn JSON only in this shape:\n{{\"intent\":\"none|image_generate|image_edit|...\",\"confidence\":0.0,\"reason\":\"short explanation\"}}\n\nCurrent user request:\n{}\n\nRecent context:\n{}",
+            self.intent_classifier_prompt,
+            description,
+            if recent_context.is_empty() { "(none)".to_string() } else { recent_context }
+        );
+        let response = llm
+            .complete(
+                vec![
+                    ChatMessage::system("Return valid JSON only."),
+                    ChatMessage::user(prompt),
+                ],
+                &[],
+            )
+            .await
+            .ok()?;
+        debug!(
+            classifier_response = %truncate_text(&response.content, 400),
+            "vizier intent classifier response"
+        );
+        let decision: IntentDecision = parse_intent_decision(&response.content)
+            .or_else(|| detect_intent_scope_with_context(description, messages).map(|intent| IntentDecision {
+                intent,
+                confidence: 0.6,
+                reason: "deterministic fallback".into(),
+            }))?;
+        let intent = decision.intent.trim().to_string();
+        if intent.is_empty() || intent == "none" || decision.confidence < 0.55 {
+            None
+        } else {
+            info!(intent = %intent, confidence = decision.confidence, reason = %decision.reason, "vizier intent classifier selected route");
+            Some(ModelRouteScope::Intent(intent))
+        }
+    }
+
+    fn explicit_skill_mention(&self, description: &str) -> bool {
+        let lower = description.to_ascii_lowercase();
+        self.capability_registry
+            .all()
+            .into_iter()
+            .any(|card| matches!(card.kind, CapabilityKind::Skill(_))
+                && (lower.contains(&card.id.0.to_ascii_lowercase())
+                    || lower.contains(&card.name.to_ascii_lowercase())))
     }
 
     async fn nudge_capability_refs(
@@ -530,7 +614,9 @@ impl Vizier {
                 self.session_id.clone(),
                 task_llm,
                 self.tool_registry.clone(),
+                self.store.clone(),
                 self.status_tx.clone(),
+                self.cancel_registry.clone(),
             ));
 
             let result = minion.ask(RunTask(envelope.clone())).send().await;
@@ -583,6 +669,16 @@ struct CapabilityNudgeDecision {
     reason: String,
 }
 
+#[derive(serde::Deserialize)]
+struct IntentDecision {
+    #[serde(default)]
+    intent: String,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    reason: String,
+}
+
 fn capability_query_text(description: &str, messages: &[ChatMessage]) -> String {
     let mut parts = vec![description.trim().to_string()];
     for message in messages.iter().rev().take(8).rev() {
@@ -616,31 +712,53 @@ fn maybe_push_capability(target: &mut Vec<CapabilityId>, candidate: Option<Capab
     }
 }
 
-fn text_has_any(text: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| text.contains(needle))
+fn text_has_any_terms(text: &str, needles: &[String]) -> bool {
+    needles.iter().any(|needle| text.contains(&needle.to_ascii_lowercase()))
 }
 
-fn detect_intent_scope(query_text: &str) -> Option<ModelRouteScope> {
-    let lower = query_text.to_ascii_lowercase();
-    let image_terms = ["image", "picture", "photo", "illustration", "logo", "banner"];
-    if !text_has_any(&lower, &image_terms) {
+fn parse_intent_decision(content: &str) -> Option<IntentDecision> {
+    serde_json::from_str(content).ok().or_else(|| {
+        let start = content.find('{')?;
+        let end = content.rfind('}')?;
+        serde_json::from_str(&content[start..=end]).ok()
+    })
+}
+
+fn detect_intent_scope_fallback(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let image_terms = ["image", "picture", "photo", "illustration", "poster", "logo", "banner"];
+    if !image_terms.iter().any(|term| lower.contains(term)) {
         return None;
     }
+    if ["edit", "modify", "change", "remove background", "retouch", "outpaint", "inpaint"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        return Some("image_edit".into());
+    }
+    if ["create", "generate", "make", "draw", "render", "design"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        return Some("image_generate".into());
+    }
+    None
+}
 
-    if text_has_any(
-        &lower,
-        &["edit", "modify", "change", "remove background", "retouch", "outpaint", "inpaint"],
-    ) {
-        return Some(ModelRouteScope::Intent("image_edit".into()));
+fn detect_intent_scope_with_context(text: &str, messages: &[ChatMessage]) -> Option<String> {
+    if let Some(intent) = detect_intent_scope_fallback(text) {
+        return Some(intent);
     }
 
-    if text_has_any(
-        &lower,
-        &["create", "generate", "make", "draw", "render", "design"],
-    ) {
-        return Some(ModelRouteScope::Intent("image_generate".into()));
+    let lower = text.to_ascii_lowercase();
+    let has_image_input = messages.iter().any(|message| !message.image_inputs.is_empty());
+    if has_image_input
+        && ["edit", "modify", "change", "restyle", "style", "transform", "turn this into", "make this look like"]
+            .iter()
+            .any(|term| lower.contains(term))
+    {
+        return Some("image_edit".into());
     }
-
     None
 }
 
@@ -671,6 +789,58 @@ fn trim_messages_for_intent(
     }
 }
 
+fn merge_task_policy_with_message_requirements(
+    base: Option<&ModelSelectionPolicy>,
+    messages: &[ChatMessage],
+) -> Option<ModelSelectionPolicy> {
+    let has_image_inputs = messages.iter().any(|message| !message.image_inputs.is_empty());
+    if !has_image_inputs {
+        return base.cloned();
+    }
+
+    let mut policy = base.cloned().unwrap_or_default();
+    if !policy.required_traits.contains(&maat_core::ModelTrait::Vision) {
+        policy.required_traits.push(maat_core::ModelTrait::Vision);
+    }
+    Some(policy)
+}
+
+fn intent_context_excerpt(messages: &[ChatMessage]) -> String {
+    let mut excerpts = messages
+        .iter()
+        .filter_map(|message| match message.role {
+            Role::System if message.content.starts_with("[LATEST ARTIFACT]") => {
+                Some(format!("system: {}", truncate_text(&message.content, 220)))
+            }
+            Role::User | Role::Assistant | Role::Tool => {
+                let role = match message.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                    Role::System => unreachable!(),
+                };
+                Some(format!("{role}: {}", truncate_text(&message.content, 220)))
+            }
+            Role::System => None,
+        })
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>();
+    excerpts.reverse();
+    excerpts.join("\n")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for ch in text.chars().take(max_chars) {
+        result.push(ch);
+    }
+    if text.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +851,7 @@ mod tests {
         ProviderApiStyle, StopReason, TokenUsage,
     };
     use maat_llm::{CompletionResponse, LlmClient};
+    use maat_memory::{sqlite::SqliteStore, MemoryStore};
     use serde_json::json;
     use tokio::sync::broadcast;
 
@@ -720,23 +891,6 @@ mod tests {
         assert!(query.contains("do it properly"));
     }
 
-    #[test]
-    fn detects_image_generation_and_edit_intents() {
-        assert_eq!(
-            detect_intent_scope("create an image banner for the landing page"),
-            Some(ModelRouteScope::Intent("image_generate".into()))
-        );
-        assert_eq!(
-            detect_intent_scope("edit this image and remove the background"),
-            Some(ModelRouteScope::Intent("image_edit".into()))
-        );
-        assert_eq!(detect_intent_scope("look at this image and summarize it"), None);
-        assert_eq!(
-            detect_intent_scope("send it to troy.travlos@gmail.com"),
-            None
-        );
-    }
-
     #[tokio::test]
     async fn image_generation_intent_avoids_tool_capability_shortlist() {
         let vizier = Vizier::new(
@@ -747,8 +901,12 @@ mod tests {
             Arc::new(CapabilityRegistry::new()),
             Arc::new(ModelRegistry::new()),
             Arc::new(vec![]),
+            test_store(),
+            Arc::new(vec![]),
+            "return json".into(),
             "return json".into(),
             broadcast::channel(8).0,
+            CancellationRegistry::new(),
         );
 
         let refs = vizier
@@ -756,6 +914,7 @@ mod tests {
                 "create an image of a clown in art deco poster style",
                 &[],
                 &ModelSpec::openrouter_default(),
+                Some(&ModelRouteScope::Intent("image_generate".into())),
             )
             .await;
 
@@ -823,8 +982,21 @@ mod tests {
             Arc::new(registry),
             Arc::new(model_registry),
             Arc::new(vec![]),
+            test_store(),
+            Arc::new(vec![
+                SupportCapabilityRule {
+                    match_any_terms: vec!["email".into()],
+                    capability_ids: vec![CapabilityId("gmail_send".into())],
+                },
+                SupportCapabilityRule {
+                    match_any_terms: vec!["pdf".into()],
+                    capability_ids: vec![CapabilityId("file_write".into())],
+                },
+            ]),
+            "return json".into(),
             "return json".into(),
             status_tx,
+            CancellationRegistry::new(),
         );
 
         let refs = vizier
@@ -835,12 +1007,42 @@ mod tests {
                     ChatMessage::assistant("I can use the pdf skill and gmail_send."),
                 ],
                 &ModelSpec::openrouter_default(),
+                None,
             )
             .await;
 
         assert!(refs.contains(&CapabilityId("pdf".into())));
         assert!(refs.contains(&CapabilityId("file_write".into())));
         assert!(refs.contains(&CapabilityId("gmail_send".into())));
+    }
+
+    #[test]
+    fn intent_context_excerpt_is_small_and_keeps_latest_artifact() {
+        let excerpt = intent_context_excerpt(&[
+            ChatMessage::system("ignore this"),
+            ChatMessage::system("[LATEST ARTIFACT] handle=bright-canvas-a1b2 kind=image"),
+            ChatMessage::assistant("Created artifacts:\n- bright-canvas-a1b2"),
+            ChatMessage::user("send it to troy@example.com"),
+        ]);
+        assert!(excerpt.contains("LATEST ARTIFACT"));
+        assert!(excerpt.contains("send it to"));
+        assert!(!excerpt.contains("ignore this"));
+    }
+
+    #[test]
+    fn fallback_detects_obvious_image_routes() {
+        assert_eq!(
+            detect_intent_scope_fallback("can you make me an image poster saying PLAY!"),
+            Some("image_generate".into())
+        );
+        assert_eq!(
+            detect_intent_scope_fallback("edit that image and remove the background"),
+            Some("image_edit".into())
+        );
+        assert_eq!(
+            detect_intent_scope_fallback("email it to troy@example.com"),
+            None
+        );
     }
 
     fn test_card(
@@ -868,5 +1070,11 @@ mod tests {
             permissions,
             routing_hints: None,
         }
+    }
+
+    fn test_store() -> Arc<dyn MemoryStore> {
+        let root = std::env::temp_dir().join(format!("maat-vizier-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        Arc::new(SqliteStore::open(&root.join("test.db")).unwrap())
     }
 }

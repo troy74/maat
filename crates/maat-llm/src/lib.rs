@@ -20,8 +20,9 @@ use async_openai::{
     Client,
 };
 use async_trait::async_trait;
+use base64::Engine;
 use maat_core::{
-    ChatMessage, GeneratedArtifact, LlmToolDef, MaatError, ModelSpec, PendingToolCall, Role,
+    ChatImageInput, ChatMessage, GeneratedArtifact, LlmToolDef, MaatError, ModelSpec, PendingToolCall, Role,
     StopReason, TokenUsage,
 };
 use serde_json::json;
@@ -67,6 +68,7 @@ pub struct OpenAiCompatClient {
     profile_id: Option<String>,
     max_tokens: u32,
     temperature: f32,
+    supports_vision_input: bool,
 }
 
 impl OpenAiCompatClient {
@@ -91,6 +93,7 @@ impl OpenAiCompatClient {
             profile_id: spec.profile_id.clone(),
             max_tokens: spec.max_tokens,
             temperature: spec.temperature,
+            supports_vision_input: spec.supports_vision_input,
         })
     }
 }
@@ -162,15 +165,15 @@ fn to_api_tool(t: &LlmToolDef) -> ChatCompletionTool {
     }
 }
 
-fn to_json_message(m: ChatMessage) -> serde_json::Value {
-    match m.role {
+fn to_json_message(m: ChatMessage) -> Result<serde_json::Value, MaatError> {
+    let value = match m.role {
         Role::System => json!({
             "role": "system",
             "content": m.content,
         }),
         Role::User => json!({
             "role": "user",
-            "content": m.content,
+            "content": user_content_value(&m)?,
         }),
         Role::Assistant => {
             let tool_calls = m
@@ -204,7 +207,8 @@ fn to_json_message(m: ChatMessage) -> serde_json::Value {
             "tool_call_id": m.tool_call_id.unwrap_or_default(),
             "content": m.content,
         }),
-    }
+    };
+    Ok(value)
 }
 
 // ─────────────────────────────────────────────
@@ -218,8 +222,8 @@ impl LlmClient for OpenAiCompatClient {
         messages: Vec<ChatMessage>,
         tools: &[LlmToolDef],
     ) -> Result<CompletionResponse, MaatError> {
-        if self.should_request_image_output() {
-            return self.complete_with_image_output(messages, tools).await;
+        if self.should_request_json_chat(&messages) {
+            return self.complete_json_chat(messages, tools).await;
         }
 
         let api_messages: Vec<ChatCompletionRequestMessage> = messages
@@ -307,19 +311,35 @@ impl OpenAiCompatClient {
             || self.model_id.contains("image-preview")
     }
 
-    async fn complete_with_image_output(
+    fn should_request_json_chat(&self, messages: &[ChatMessage]) -> bool {
+        self.should_request_image_output() || messages.iter().any(|message| !message.image_inputs.is_empty())
+    }
+
+    async fn complete_json_chat(
         &self,
         messages: Vec<ChatMessage>,
         tools: &[LlmToolDef],
     ) -> Result<CompletionResponse, MaatError> {
-        let api_messages = messages.into_iter().map(to_json_message).collect::<Vec<_>>();
+        if messages.iter().any(|message| !message.image_inputs.is_empty()) && !self.supports_vision_input {
+            return Err(MaatError::Llm(format!(
+                "model '{}' does not support image inputs; route this request to a vision-capable profile",
+                self.model_id
+            )));
+        }
+
+        let api_messages = messages
+            .into_iter()
+            .map(to_json_message)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut body = json!({
             "model": self.model_id,
             "messages": api_messages,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "modalities": ["image", "text"],
         });
+        if self.should_request_image_output() {
+            body["modalities"] = json!(["image", "text"]);
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(
                 tools.iter().map(|tool| {
@@ -334,6 +354,13 @@ impl OpenAiCompatClient {
                 }).collect()
             );
         }
+        debug!(
+            model = %self.model_id,
+            tools = tools.len(),
+            vision_inputs = messages_have_image_inputs(&body["messages"]),
+            request_image_output = self.should_request_image_output(),
+            "→ LLM multimodal"
+        );
 
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
         let t0 = std::time::Instant::now();
@@ -355,6 +382,7 @@ impl OpenAiCompatClient {
         }
         debug!(
             model = %self.model_id,
+            vision_inputs = messages_have_image_inputs(&body["messages"]),
             raw_preview = %truncate_for_log(&raw_json, 1200),
             "image-output raw response"
         );
@@ -430,6 +458,65 @@ impl OpenAiCompatClient {
             generated_artifacts,
         })
     }
+}
+
+fn user_content_value(message: &ChatMessage) -> Result<serde_json::Value, MaatError> {
+    if message.image_inputs.is_empty() {
+        return Ok(json!(message.content));
+    }
+
+    let mut parts = Vec::new();
+    if !message.content.trim().is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    for image in &message.image_inputs {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image_input_data_url(image)?,
+            }
+        }));
+    }
+    Ok(serde_json::Value::Array(parts))
+}
+
+fn image_input_data_url(image: &ChatImageInput) -> Result<String, MaatError> {
+    if let Some(data_base64) = &image.data_base64 {
+        return Ok(format!("data:{};base64,{}", image.mime_type, data_base64));
+    }
+    let source_path = image
+        .source_path
+        .as_deref()
+        .ok_or_else(|| MaatError::Llm(format!("image input '{}' has no source path or data", image.label)))?;
+    let bytes = std::fs::read(source_path)
+        .map_err(|e| MaatError::Llm(format!("read image input '{}': {e}", source_path)))?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{};base64,{}", image.mime_type, data_base64))
+}
+
+fn messages_have_image_inputs(messages: &serde_json::Value) -> bool {
+    messages
+        .as_array()
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .map(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type")
+                                .and_then(|kind| kind.as_str())
+                                .map(|kind| kind == "image_url")
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn json_content_to_string(value: &serde_json::Value) -> Option<String> {
@@ -556,6 +643,7 @@ fn truncate_for_log(value: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maat_core::ChatImageInput;
 
     #[test]
     fn parses_generated_images_from_data_urls() {
@@ -566,5 +654,35 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].mime_type, "image/png");
         assert_eq!(parsed[0].data_base64, "QUJDRA==");
+    }
+
+    #[test]
+    fn serializes_user_image_input_as_multimodal_content() {
+        let message = ChatMessage::user_with_images(
+            "Edit this image into an art deco poster.",
+            vec![ChatImageInput {
+                mime_type: "image/png".into(),
+                label: "poster-source".into(),
+                source_path: None,
+                data_base64: Some("QUJDRA==".into()),
+            }],
+        );
+
+        let json = to_json_message(message).expect("multimodal user message");
+        let content = json
+            .get("content")
+            .and_then(|value| value.as_array())
+            .expect("content array");
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].get("type").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(content[1].get("type").and_then(|v| v.as_str()), Some("image_url"));
+        assert_eq!(
+            content[1]
+                .get("image_url")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str()),
+            Some("data:image/png;base64,QUJDRA==")
+        );
     }
 }

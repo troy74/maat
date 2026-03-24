@@ -7,6 +7,7 @@ edition = "2021"
 maat-core    = { path = "../maat-core" }
 maat-minions = { path = "../maat-minions" }
 maat-llm     = { path = "../maat-llm" }
+maat-memory  = { path = "../maat-memory" }
 kameo        = { workspace = true }
 tokio        = { workspace = true }
 tracing      = { workspace = true }
@@ -14,3 +15,4 @@ anyhow       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 async-trait  = { workspace = true }
+ulid         = { workspace = true }

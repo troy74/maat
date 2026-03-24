@@ -1,0 +1,10 @@
+id = "image-rectify"
+name = "Image Rectify"
+trust = "trusted"
+permissions = ["file_read", "file_write", "process_spawn"]
+source_kind = "workspace"
+
+[execution]
+mode = "command"
+command = "bash"
+args = ["bin/run-image-rectify"]

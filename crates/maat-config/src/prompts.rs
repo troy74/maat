@@ -9,6 +9,7 @@ pub struct PromptLibrary {
     pub primary_system: String,
     pub named_session: String,
     pub compaction: String,
+    pub intent_classifier: String,
     pub capability_nudge: String,
     bouquet: PromptBouquet,
 }
@@ -62,6 +63,10 @@ impl PromptLibrary {
             primary_system: read_or_default(dir.join("primary_system.md"), DEFAULT_PRIMARY_SYSTEM),
             named_session: read_or_default(dir.join("named_session.md"), DEFAULT_NAMED_SESSION),
             compaction: read_or_default(dir.join("compaction.md"), DEFAULT_COMPACTION),
+            intent_classifier: read_or_default(
+                dir.join("intent_classifier.md"),
+                DEFAULT_INTENT_CLASSIFIER,
+            ),
             capability_nudge: read_or_default(
                 dir.join("capability_nudge.md"),
                 DEFAULT_CAPABILITY_NUDGE,
@@ -187,6 +192,12 @@ impl PromptLibrary {
                 path: self.dir.join("compaction.md"),
                 policy: None,
                 content: self.compaction.clone(),
+            },
+            PromptAssetInfo {
+                name: "intent_classifier".into(),
+                path: self.dir.join("intent_classifier.md"),
+                policy: None,
+                content: self.intent_classifier.clone(),
             },
             PromptAssetInfo {
                 name: "capability_nudge".into(),
@@ -362,6 +373,8 @@ const DEFAULT_PRIMARY_SYSTEM: &str = "You are MAAT.\n\n{{BOUQUET}}\n\nYou have a
 const DEFAULT_NAMED_SESSION: &str = "You are MAAT.\n\n{{BOUQUET}}\n\nSession context:\n{{SESSION_CONTEXT}}\n\nYou have access to the following tools and MUST use them when relevant instead of saying you cannot perform a task:\n{{TOOLS}}\n";
 
 const DEFAULT_COMPACTION: &str = "You are a concise summariser. Summarise the conversation below, preserving key facts, decisions, user preferences, and important context. Be brief and avoid editorializing.";
+
+const DEFAULT_INTENT_CLASSIFIER: &str = "You are MAAT's routing intent classifier. Classify the current user turn into a small route label when it clearly implies a specialist lane. Use recent context only to resolve references like 'it' or 'that'. Return strict JSON only.";
 
 const DEFAULT_CAPABILITY_NUDGE: &str = "You are a capability router. Given a user request and a shortlist of candidate capabilities, pick the best-fit capabilities and explain the fit briefly. Prefer explicit tag/schema matches, but use semantic clues when metadata is incomplete. Never override hard policy constraints.";
 

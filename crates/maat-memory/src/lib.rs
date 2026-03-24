@@ -9,7 +9,7 @@ pub mod sqlite;
 pub mod window;
 
 use async_trait::async_trait;
-use maat_core::{ChatMessage, MaatError, Role, SessionId};
+use maat_core::{BackgroundRunStatus, ChatMessage, MaatError, Role, SessionId};
 use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────
@@ -59,6 +59,7 @@ impl StoredMessage {
         ChatMessage {
             role,
             content: self.content.clone(),
+            image_inputs: vec![],
             tool_call_id: self.tool_call_id.clone(),
             tool_calls_json: self.tool_calls_json.clone(),
         }
@@ -132,6 +133,35 @@ impl ArtifactRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationRunRecord {
+    pub run_id: String,
+    pub automation_id: String,
+    pub automation_name: String,
+    pub status: String,
+    pub started_at_ms: u64,
+    pub finished_at_ms: u64,
+    pub summary: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundRunRecord {
+    pub run_id: String,
+    pub handle: String,
+    pub user_id: String,
+    pub parent_session_id: String,
+    pub session_name: String,
+    pub title: String,
+    pub prompt: String,
+    pub status: BackgroundRunStatus,
+    pub summary: String,
+    pub error: Option<String>,
+    pub created_at_ms: u64,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
 // ─────────────────────────────────────────────
 // MemoryStore trait
 // ─────────────────────────────────────────────
@@ -182,6 +212,28 @@ pub trait MemoryStore: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Option<ArtifactRecord>, MaatError>;
+    async fn save_automation_run(&self, run: &AutomationRunRecord) -> Result<(), MaatError>;
+    async fn latest_automation_run(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<AutomationRunRecord>, MaatError>;
+    async fn list_automation_runs(
+        &self,
+        automation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationRunRecord>, MaatError>;
+    async fn save_background_run(&self, run: &BackgroundRunRecord) -> Result<(), MaatError>;
+    async fn get_background_run_by_handle(
+        &self,
+        user_id: &str,
+        handle: &str,
+    ) -> Result<Option<BackgroundRunRecord>, MaatError>;
+    async fn list_background_runs(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackgroundRunRecord>, MaatError>;
+    async fn allocate_background_run_handle(&self, title: &str) -> Result<String, MaatError>;
     async fn mark_compacted(&self, session_id: &str, before_ms: u64) -> Result<(), MaatError>;
     /// Mark the oldest `count` uncompacted messages in a session as compacted.
     async fn mark_compacted_count(&self, session_id: &str, count: usize) -> Result<(), MaatError>;

@@ -4,7 +4,7 @@
 //! `/secret set` writes to the first writable store.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -34,17 +34,33 @@ pub trait SecretStore: Send + Sync {
 
 pub struct SecretResolver {
     stores: Vec<Arc<dyn SecretStore>>,
+    cache: Mutex<HashMap<String, String>>,
 }
 
 impl SecretResolver {
     pub fn new(stores: Vec<Arc<dyn SecretStore>>) -> Self {
-        Self { stores }
+        Self {
+            stores,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Resolve a secret from the chain.
     pub fn get(&self, key: &str) -> Option<String> {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(key).cloned())
+        {
+            debug!(key, "secret resolved from cache");
+            return Some(cached);
+        }
         for store in &self.stores {
             if let Some(val) = store.get(key) {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(key.to_string(), val.clone());
+                }
                 debug!(key, store = store.name(), "secret resolved");
                 return Some(val);
             }
@@ -57,6 +73,9 @@ impl SecretResolver {
         for store in &self.stores {
             if store.is_writable() {
                 store.set(key, value)?;
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(key.to_string(), value.to_string());
+                }
                 debug!(key, store = store.name(), "secret stored");
                 return Ok(());
             }
@@ -67,7 +86,13 @@ impl SecretResolver {
     pub fn delete(&self, key: &str) -> Result<(), ConfigError> {
         for store in &self.stores {
             if store.is_writable() {
-                return store.delete(key);
+                let result = store.delete(key);
+                if result.is_ok() {
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.remove(key);
+                    }
+                }
+                return result;
             }
         }
         Err(ConfigError::Secret("no writable secret store available".into()))

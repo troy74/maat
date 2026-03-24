@@ -33,7 +33,7 @@ impl Tool for GmailSend {
     fn llm_definition(&self) -> LlmToolDef {
         LlmToolDef {
             name: "gmail_send".into(),
-            description: "Send an email via Gmail. Use this when the user asks to send an email to someone, including when a local file should be attached.".into(),
+            description: "Send an email via Gmail. Use this when the user asks to send an email to someone, including when a local file or stored artifact should be attached.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -51,7 +51,14 @@ impl Tool for GmailSend {
                     },
                     "attachments": {
                         "type": "array",
-                        "description": "Optional list of relative file paths to attach, for example ['output/pdf/report.pdf']",
+                        "description": "Optional list of local file paths to attach. Prefer artifact_handles for stored MAAT artifacts; use attachments for raw workspace files, for example ['output/pdf/report.pdf']",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "artifact_handles": {
+                        "type": "array",
+                        "description": "Optional list of stored MAAT artifact handles to attach. Prefer this for artifacts already tracked by MAAT, for example ['bright-canvas-a1b2']",
                         "items": {
                             "type": "string"
                         }
@@ -267,11 +274,17 @@ fn load_attachment(base_dir: &Path, user_path: &str) -> Result<AttachmentData, M
 }
 
 fn safe_attachment_path(base_dir: &Path, user_path: &str) -> Result<PathBuf, MaatError> {
-    let stripped = user_path.trim_start_matches('/');
-    let candidate = base_dir.join(stripped);
     let canon_base = base_dir
         .canonicalize()
         .map_err(|e| MaatError::Tool(format!("base_dir canonicalise: {e}")))?;
+    let candidate = {
+        let raw = PathBuf::from(user_path);
+        if raw.is_absolute() {
+            raw
+        } else {
+            base_dir.join(raw)
+        }
+    };
     let canon_candidate = candidate
         .canonicalize()
         .map_err(|e| MaatError::Tool(format!("attachment canonicalise: {e}")))?;
@@ -333,6 +346,33 @@ mod tests {
         assert!(raw.contains("multipart/mixed"));
         assert!(raw.contains("filename=\"sample.pdf\""));
         assert!(raw.contains("application/pdf"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn llm_definition_exposes_artifact_handles() {
+        let tool = GmailSend {
+            client_id: String::new(),
+            client_secret: String::new(),
+            resolver: std::sync::Arc::new(maat_config::secrets::build_resolver(None, None)),
+            config: std::sync::Arc::new(maat_config::MaatConfig::default()),
+            base_dir: std::env::temp_dir(),
+        };
+        let def = tool.llm_definition();
+        assert!(def.parameters["properties"]["artifact_handles"].is_object());
+    }
+
+    #[test]
+    fn safe_attachment_path_allows_absolute_paths_within_base_dir() {
+        let base_dir = std::env::temp_dir().join(format!("maat-gmail-abs-{}", maat_core::now_ms()));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("sample.pdf");
+        std::fs::write(&path, b"fake-pdf").unwrap();
+
+        let resolved = safe_attachment_path(&base_dir, path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, path.canonicalize().unwrap());
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(base_dir);

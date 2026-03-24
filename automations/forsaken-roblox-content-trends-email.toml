@@ -1,0 +1,10 @@
+id = "forsaken-roblox-content-trends-email"
+name = "Forsaken Roblox content trends email"
+prompt = "Search up the latest trends in short content (YouTube Shorts/TikTok/etc.) for Forsaken Roblox and related niche content. Suggest 3 pieces of short-form content and 1 long-form content idea that will engage current community interests. Then send the findings as an email to troy.travlos@gmail.com."
+status = "active"
+session = "automation"
+
+[schedule]
+kind = "daily"
+hour = 9
+minute = 0

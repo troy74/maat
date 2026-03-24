@@ -300,6 +300,68 @@ pub fn install_skill(source: InstallSource, dest_root: &Path) -> Result<Installe
     }
 }
 
+pub fn fetch_github_asset(
+    repo: &str,
+    path: &str,
+    reference: Option<&str>,
+    dest_path: &Path,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("github asset path cannot be empty".into());
+    }
+    let checkout_root = github_checkout_root("asset");
+    let repo_url = format!("https://github.com/{repo}.git");
+    let mut clone = Command::new("git");
+    clone
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--filter=blob:none")
+        .arg("--sparse");
+    if let Some(reference) = reference.filter(|value| !value.trim().is_empty()) {
+        clone.arg("--branch").arg(reference.trim());
+    }
+    let clone_status = clone
+        .arg(&repo_url)
+        .arg(&checkout_root)
+        .status()
+        .map_err(|e| format!("failed to launch git clone: {e}"))?;
+    if !clone_status.success() {
+        return Err(format!("git clone failed for repository {repo}."));
+    }
+
+    let sparse_status = Command::new("git")
+        .arg("-C")
+        .arg(&checkout_root)
+        .arg("sparse-checkout")
+        .arg("set")
+        .arg(path)
+        .status()
+        .map_err(|e| format!("failed to configure sparse checkout: {e}"))?;
+    if !sparse_status.success() {
+        let _ = fs::remove_dir_all(&checkout_root);
+        return Err(format!("git sparse-checkout failed for {repo}:{path}."));
+    }
+
+    let source_path = checkout_root.join(path);
+    if !source_path.exists() || source_path.is_dir() {
+        let _ = fs::remove_dir_all(&checkout_root);
+        return Err(format!("github asset {repo}:{path} was not found as a file."));
+    }
+
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    fs::copy(&source_path, dest_path)
+        .map_err(|e| format!("failed to copy asset to {}: {e}", dest_path.display()))?;
+    if let Ok(metadata) = fs::metadata(&source_path) {
+        let _ = fs::set_permissions(dest_path, metadata.permissions());
+    }
+    let _ = fs::remove_dir_all(&checkout_root);
+    Ok(())
+}
+
 pub fn search_clawhub(query: &str) -> Result<String, String> {
     let output = Command::new("clawhub")
         .arg("search")
@@ -592,13 +654,7 @@ fn install_skill_from_github(
     fs::create_dir_all(dest_root)
         .map_err(|e| format!("failed to create destination root {}: {e}", dest_root.display()))?;
 
-    let checkout_root = std::env::temp_dir().join(format!(
-        "maat-github-skill-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let checkout_root = github_checkout_root("skill");
     let repo_url = format!("https://github.com/{repo}.git");
     let clone_status = Command::new("git")
         .arg("clone")
@@ -658,6 +714,16 @@ fn install_skill_from_github(
     Ok(skill)
 }
 
+fn github_checkout_root(kind: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "maat-github-{kind}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
 fn snapshot_skill_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut dirs = Vec::new();
     if !root.exists() {
@@ -704,6 +770,14 @@ impl Tool for InstalledSkillTool {
                         "type": "string",
                         "description": "What you want this skill to help with."
                     },
+                    "artifact_handle": {
+                        "type": "string",
+                        "description": "Optional stored MAAT artifact handle to use as the primary input file."
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Optional local input file path for command-mode skills that work on an existing file."
+                    },
                     "title": {
                         "type": "string",
                         "description": "Optional artifact title or short label for the skill to use."
@@ -717,7 +791,7 @@ impl Tool for InstalledSkillTool {
                         "description": "Optional relative output path for a generated artifact, for example 'output/pdf/report.pdf'."
                     }
                 },
-                "required": ["request"]
+                "required": []
             }),
         }
     }
@@ -788,7 +862,9 @@ impl Tool for InstalledSkillTool {
                     "mode": "command",
                     "skill": self.skill.name,
                     "request": request,
-                    "stdout": String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    "stdout": String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                    "result": serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                        .unwrap_or(serde_json::Value::Null)
                 }))
             }
         }

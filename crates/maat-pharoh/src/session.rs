@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use kameo::{actor::ActorRef, request::MessageSend, Actor};
 use maat_core::{
-    CapabilityRegistry, ChatMessage, ChatReply, MaatError, ModelRegistry, ModelRouteRule,
+    CancellationRegistry, CapabilityRegistry, ChatImageInput, ChatMessage, ChatReply, MaatError, ModelRegistry, ModelRouteRule,
     ModelRouteScope, ModelSpec, ResourceBudget, RetryPolicy, SessionId, SessionName,
-    SessionState, StatusEvent, StatusKind, StepId, ToolRegistry, TraceId, UserId,
+    SessionState, StatusEvent, StatusKind, StepId, SupportCapabilityRule, ToolRegistry,
+    TraceId, UserId,
 };
 use maat_memory::{
+    ArtifactRecord,
     window::{build_window, total_history_tokens, window_keep_count},
     ContextConfig, MemoryStore, SessionMeta, StoredMessage,
 };
@@ -41,8 +43,18 @@ pub struct NamedSession {
     ctx_config: ContextConfig,
     model: ModelSpec,
     model_registry: Arc<ModelRegistry>,
+    route_rules: Arc<Vec<ModelRouteRule>>,
+    support_rules: Arc<Vec<SupportCapabilityRule>>,
+    intent_classifier_prompt: String,
+    capability_nudge_prompt: String,
     compaction_prompt: String,
     status_tx: broadcast::Sender<StatusEvent>,
+    cancel_registry: CancellationRegistry,
+}
+
+pub struct ReloadRuntime {
+    pub tool_registry: Arc<ToolRegistry>,
+    pub capability_registry: Arc<CapabilityRegistry>,
 }
 
 impl NamedSession {
@@ -58,10 +70,13 @@ impl NamedSession {
         model: ModelSpec,
         model_registry: Arc<ModelRegistry>,
         route_rules: Arc<Vec<ModelRouteRule>>,
+        support_rules: Arc<Vec<SupportCapabilityRule>>,
+        intent_classifier_prompt: String,
         capability_nudge_prompt: String,
         compaction_prompt: String,
         system_prompt: impl Into<String>,
         status_tx: broadcast::Sender<StatusEvent>,
+        cancel_registry: CancellationRegistry,
     ) -> Self {
         let vizier = kameo::spawn(Vizier::new(
             user_id.clone(),
@@ -71,8 +86,12 @@ impl NamedSession {
             capability_registry,
             model_registry.clone(),
             route_rules.clone(),
-            capability_nudge_prompt,
+            store.clone(),
+            support_rules.clone(),
+            intent_classifier_prompt.clone(),
+            capability_nudge_prompt.clone(),
             status_tx.clone(),
+            cancel_registry.clone(),
         ));
         let system_prompt = system_prompt.into();
         let meta = SessionMeta {
@@ -115,12 +134,39 @@ impl NamedSession {
             ctx_config,
             model,
             model_registry,
+            route_rules,
+            support_rules,
+            intent_classifier_prompt,
+            capability_nudge_prompt,
             compaction_prompt,
             status_tx,
+            cancel_registry,
         }
     }
 
     fn vizier_llm(&self) -> Arc<dyn LlmClient> { self.llm.clone() }
+
+    fn spawn_vizier(
+        &self,
+        tool_registry: Arc<ToolRegistry>,
+        capability_registry: Arc<CapabilityRegistry>,
+    ) -> ActorRef<Vizier> {
+        kameo::spawn(Vizier::new(
+            self.user_id.clone(),
+            self.session_id.clone(),
+            self.llm.clone(),
+            tool_registry,
+            capability_registry,
+            self.model_registry.clone(),
+            self.route_rules.clone(),
+            self.store.clone(),
+            self.support_rules.clone(),
+            self.intent_classifier_prompt.clone(),
+            self.capability_nudge_prompt.clone(),
+            self.status_tx.clone(),
+            self.cancel_registry.clone(),
+        ))
+    }
 
     async fn persist_message(&self, msg: &ChatMessage) {
         let stored = StoredMessage::from_chat(&self.session_id, msg);
@@ -165,6 +211,49 @@ impl NamedSession {
         Ok(lines)
     }
 
+    async fn compact_history_if_needed(&mut self) {
+        if total_history_tokens(&self.history) > self.ctx_config.compaction_threshold {
+            let keep = window_keep_count(&self.history, &self.ctx_config);
+            let compact_count = self.history.len().saturating_sub(keep);
+            if compact_count > 0 {
+                let to_compact = self.history[..compact_count].to_vec();
+                let sid = self.session_id.0.to_string();
+                match crate::compaction::compact(
+                    &to_compact,
+                    &sid,
+                    &self.compaction_prompt,
+                    self.vizier_llm().as_ref(),
+                    self.store.as_ref(),
+                ).await {
+                    Ok(ptr) => {
+                        self.history.drain(..compact_count);
+                        self.pointer_cache.push(ptr.to_chat());
+                    }
+                    Err(e) => tracing::warn!(session = %self.name, error = %e, "compaction failed"),
+                }
+            }
+        }
+    }
+
+    async fn try_inline_reply(
+        &self,
+        context: Vec<ChatMessage>,
+        text: &str,
+    ) -> Result<Option<ChatReply>, MaatError> {
+        if !should_answer_inline(text) {
+            return Ok(None);
+        }
+        let response = self.llm.complete(context, &[]).await?;
+        if matches!(response.stop_reason, maat_core::StopReason::ToolUse) {
+            return Ok(None);
+        }
+        Ok(Some(ChatReply {
+            content: response.content,
+            usage: response.usage,
+            latency_ms: response.latency_ms,
+        }))
+    }
+
     fn emit(&self, trace_id: &TraceId, state: SessionState) {
         let source = maat_core::ComponentAddress::Session(
             self.user_id.clone(),
@@ -190,12 +279,41 @@ impl NamedSession {
                 .await
             {
                 context.push(ChatMessage::system(format!(
-                    "[LATEST ARTIFACT] handle={} kind={} mime={} path={} summary={}",
-                    artifact.handle, artifact.kind, artifact.mime_type, artifact.storage_path, artifact.summary
+                    "[LATEST ARTIFACT] handle={} kind={} mime={} name={} summary={} Use the artifact handle with tools when possible; do not rely on raw storage paths unless a tool explicitly requires them.",
+                    artifact.handle, artifact.kind, artifact.mime_type, artifact.display_name, artifact.summary
                 )));
             }
         }
         context
+    }
+
+    async fn build_context_for_message(
+        &self,
+        text: &str,
+        attached_artifacts: &[ArtifactRecord],
+    ) -> Vec<ChatMessage> {
+        let mut context = self.build_context_for_text(text).await;
+        for artifact in attached_artifacts {
+            context.push(ChatMessage::system(format!(
+                "[ATTACHED ARTIFACT] handle={} kind={} mime={} name={} summary={} Use the artifact handle with tools when possible.",
+                artifact.handle, artifact.kind, artifact.mime_type, artifact.display_name, artifact.summary
+            )));
+        }
+        attach_image_inputs_to_current_turn(&mut context, text, attached_artifacts);
+        context
+    }
+}
+
+impl kameo::message::Message<ReloadRuntime> for NamedSession {
+    type Reply = Result<(), MaatError>;
+
+    async fn handle(
+        &mut self,
+        msg: ReloadRuntime,
+        _ctx: kameo::message::Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.vizier = self.spawn_vizier(msg.tool_registry, msg.capability_registry);
+        Ok(())
     }
 }
 
@@ -203,17 +321,25 @@ impl NamedSession {
 // SessionChat — one user turn
 // ─────────────────────────────────────────────
 
-pub struct SessionChat(pub String);
+pub struct SessionChat {
+    pub text: String,
+    pub attached_artifacts: Vec<ArtifactRecord>,
+    pub cancel_key: Option<String>,
+}
 
 impl kameo::message::Message<SessionChat> for NamedSession {
     type Reply = Result<ChatReply, MaatError>;
 
     async fn handle(
         &mut self,
-        SessionChat(text): SessionChat,
+        SessionChat { text, attached_artifacts, cancel_key }: SessionChat,
         _ctx: kameo::message::Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let trace_id = TraceId::new();
+        if cancel_key.as_deref().is_some_and(|key| self.cancel_registry.is_cancelled(key)) {
+            self.emit(&trace_id, SessionState::Cancelled);
+            return Err(MaatError::Cancelled);
+        }
 
         info!(
             session = %self.name,
@@ -229,7 +355,25 @@ impl kameo::message::Message<SessionChat> for NamedSession {
         let user_msg = ChatMessage::user(&text);
         self.persist_message(&user_msg).await;
         self.history.push(user_msg);
-        let context = self.build_context_for_text(&text).await;
+        let context = if attached_artifacts.is_empty() {
+            self.build_context_for_text(&text).await
+        } else {
+            self.build_context_for_message(&text, &attached_artifacts).await
+        };
+        let imported_lines = format_artifact_lines("Attached artifacts", &attached_artifacts);
+
+        if attached_artifacts.is_empty() {
+            if let Some(reply) = self.try_inline_reply(context.clone(), &text).await? {
+                let asst_msg = ChatMessage::assistant(&reply.content);
+                self.persist_message(&asst_msg).await;
+                self.history.push(asst_msg);
+                self.last_summary = reply.content.chars().take(80).collect::<String>()
+                    + if reply.content.len() > 80 { "…" } else { "" };
+                self.compact_history_if_needed().await;
+                self.emit(&trace_id, SessionState::Idle);
+                return Ok(reply);
+            }
+        }
 
         let result = self
             .vizier
@@ -243,12 +387,13 @@ impl kameo::message::Message<SessionChat> for NamedSession {
                 resource_budget: ResourceBudget::default(),
                 retry: RetryPolicy::default(),
                 deadline_ms: None,
+                cancel_key,
             }))
             .send()
             .await
             .map_err(|e| MaatError::Actor(e.to_string()))?;
 
-        let content = match result.outcome {
+        let content = merge_artifact_notice(imported_lines, match result.outcome {
             maat_core::TaskOutcome::Success { content, generated_artifacts, .. } => {
                 let artifact_lines = self.persist_generated_artifacts(&generated_artifacts).await?;
                 if artifact_lines.is_empty() {
@@ -271,33 +416,12 @@ impl kameo::message::Message<SessionChat> for NamedSession {
                 self.emit(&trace_id, SessionState::Cancelled);
                 return Err(MaatError::Llm("cancelled".into()));
             }
-        };
+        });
 
         let asst_msg = ChatMessage::assistant(&content);
         self.persist_message(&asst_msg).await;
         self.history.push(asst_msg);
-
-        if total_history_tokens(&self.history) > self.ctx_config.compaction_threshold {
-            let keep = window_keep_count(&self.history, &self.ctx_config);
-            let compact_count = self.history.len().saturating_sub(keep);
-            if compact_count > 0 {
-                let to_compact = self.history[..compact_count].to_vec();
-                let sid = self.session_id.0.to_string();
-                match crate::compaction::compact(
-                    &to_compact,
-                    &sid,
-                    &self.compaction_prompt,
-                    self.vizier_llm().as_ref(),
-                    self.store.as_ref(),
-                ).await {
-                    Ok(ptr) => {
-                        self.history.drain(..compact_count);
-                        self.pointer_cache.push(ptr.to_chat());
-                    }
-                    Err(e) => tracing::warn!(session = %self.name, error = %e, "compaction failed"),
-                }
-            }
-        }
+        self.compact_history_if_needed().await;
 
         // Keep a short summary — first 80 chars of last assistant turn.
         self.last_summary = content.chars().take(80).collect::<String>()
@@ -316,6 +440,85 @@ fn should_attach_recent_artifact(text: &str) -> bool {
         .any(|needle| lower.contains(needle));
     let has_action = ["email", "send", "attach", "share", "use"].iter().any(|needle| lower.contains(needle));
     has_pronoun && has_action
+}
+
+fn attach_image_inputs_to_current_turn(
+    context: &mut Vec<ChatMessage>,
+    text: &str,
+    attached_artifacts: &[ArtifactRecord],
+) {
+    let image_inputs = attached_artifacts
+        .iter()
+        .filter(|artifact| artifact.mime_type.starts_with("image/"))
+        .map(|artifact| ChatImageInput {
+            mime_type: artifact.mime_type.clone(),
+            label: artifact.handle.clone(),
+            source_path: Some(artifact.storage_path.clone()),
+            data_base64: None,
+        })
+        .collect::<Vec<_>>();
+    if image_inputs.is_empty() {
+        return;
+    }
+
+    if let Some(current_user) = context.iter_mut().rev().find(|message| {
+        matches!(message.role, maat_core::Role::User) && message.content.trim() == text.trim()
+    }) {
+        current_user.image_inputs.extend(image_inputs);
+    } else {
+        context.push(ChatMessage::user_with_images(text.to_string(), image_inputs));
+    }
+}
+
+fn format_artifact_lines(label: &str, artifacts: &[ArtifactRecord]) -> Option<String> {
+    if artifacts.is_empty() {
+        return None;
+    }
+    let lines = artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "  - {}  {}  {}",
+                artifact.handle, artifact.mime_type, artifact.display_name
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(format!("{label}:\n{}", lines.join("\n")))
+}
+
+fn merge_artifact_notice(notice: Option<String>, content: String) -> String {
+    match (notice, content.trim().is_empty()) {
+        (Some(notice), true) => notice,
+        (Some(notice), false) => format!("{notice}\n\n{content}"),
+        (None, _) => content,
+    }
+}
+
+fn should_answer_inline(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > 220 {
+        return false;
+    }
+
+    let action_terms = [
+        "email", "mail", "send", "attach", "calendar", "schedule", "search", "find",
+        "read", "write", "save", "pdf", "image", "draw", "render", "edit ", "artifact",
+        "upload", "import", "browse", "list files", "tool", "skill", "session", "model",
+        "auth ", "secret ", "config ", "/",
+    ];
+    if action_terms.iter().any(|term| lower.contains(term)) {
+        return false;
+    }
+
+    let time_sensitive = [
+        "latest", "current", "today", "tomorrow", "yesterday", "news", "price", "weather",
+        "stock", "score", "recent",
+    ];
+    if time_sensitive.iter().any(|term| lower.contains(term)) {
+        return false;
+    }
+
+    true
 }
 
 // ─────────────────────────────────────────────

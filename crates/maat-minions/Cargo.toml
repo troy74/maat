@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 maat-core   = { path = "../maat-core" }
 maat-llm    = { path = "../maat-llm" }
+maat-memory = { path = "../maat-memory" }
 kameo       = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }

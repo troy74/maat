@@ -1,0 +1,10 @@
+id = "forsaken-roblox-trends-email"
+name = "Forsaken Roblox trends email"
+prompt = "Use Tavily/current web search to find CURRENT trends, named topics, and specific high-engagement discussion points around Forsaken Roblox and related niche content. Return only concrete, timely ideas with names, examples, and angles. Prioritize really engaging short-form content optimized for high-retention YouTube Shorts: strong hook in first 1-2 seconds, fast pacing, curiosity gap, rewatchability, pattern interrupts, and clear payoff. Suggest 3 specific short-form content ideas and 1 specific long-form content idea based on current trends. Include the source trend/topic names you used and keep the recommendations specific, not vague. Email the results to troy.travlos@gmail.com."
+status = "active"
+session = "automation"
+
+[schedule]
+kind = "daily"
+hour = 9
+minute = 0

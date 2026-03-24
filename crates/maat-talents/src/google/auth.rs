@@ -26,7 +26,10 @@ pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const SCOPES: &str = concat!(
     "https://www.googleapis.com/auth/gmail.send ",
     "https://mail.google.com/ ",
-    "https://www.googleapis.com/auth/calendar.readonly ",
+    "https://www.googleapis.com/auth/calendar ",
+    "https://www.googleapis.com/auth/drive ",
+    "https://www.googleapis.com/auth/documents ",
+    "https://www.googleapis.com/auth/spreadsheets ",
     "https://www.googleapis.com/auth/contacts.readonly"
 );
 

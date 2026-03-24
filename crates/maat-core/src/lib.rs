@@ -3,7 +3,8 @@
 
 pub mod commands;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -42,6 +43,8 @@ impl std::fmt::Display for SessionName {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_inputs: Vec<ChatImageInput>,
     /// For Role::Tool — the tool_call_id this result responds to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -53,19 +56,50 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), tool_call_id: None, tool_calls_json: None }
+        Self {
+            role: Role::System,
+            content: content.into(),
+            image_inputs: vec![],
+            tool_call_id: None,
+            tool_calls_json: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into(), tool_call_id: None, tool_calls_json: None }
+        Self {
+            role: Role::User,
+            content: content.into(),
+            image_inputs: vec![],
+            tool_call_id: None,
+            tool_calls_json: None,
+        }
+    }
+    pub fn user_with_images(
+        content: impl Into<String>,
+        image_inputs: Vec<ChatImageInput>,
+    ) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            image_inputs,
+            tool_call_id: None,
+            tool_calls_json: None,
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_call_id: None, tool_calls_json: None }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            image_inputs: vec![],
+            tool_call_id: None,
+            tool_calls_json: None,
+        }
     }
     /// Inject an assistant turn that requested tool calls (content is empty per OpenAI spec).
     pub fn assistant_tool_request(tool_calls: &[PendingToolCall]) -> Self {
         Self {
             role: Role::Assistant,
             content: String::new(),
+            image_inputs: vec![],
             tool_call_id: None,
             tool_calls_json: Some(serde_json::to_string(tool_calls).unwrap_or_default()),
         }
@@ -75,10 +109,21 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: result.into(),
+            image_inputs: vec![],
             tool_call_id: Some(tool_call_id.into()),
             tool_calls_json: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImageInput {
+    pub mime_type: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +177,9 @@ pub struct ModelSpec {
     /// Name of the env var that holds the API key.
     pub api_key_env: String,
 
+    #[serde(default)]
+    pub supports_vision_input: bool,
+
     pub temperature: f32,
     pub max_tokens: u32,
 }
@@ -148,6 +196,7 @@ impl ModelSpec {
                 .unwrap_or_else(|_| "minimax/minimax-m1".to_string()),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             api_key_env: "OPENROUTER_API_KEY".to_string(),
+            supports_vision_input: false,
             temperature: 0.7,
             max_tokens: 4096,
         }
@@ -250,6 +299,7 @@ pub enum ModelRouteScope {
     SessionDefault,
     SessionNamed(String),
     Planner,
+    IntentClassifier,
     CapabilityNudge,
     Summarizer,
     Intent(String),
@@ -277,6 +327,14 @@ pub struct CapabilityRoutingHints {
     pub model_policy: Option<ModelSelectionPolicy>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SupportCapabilityRule {
+    #[serde(default)]
+    pub match_any_terms: Vec<String>,
+    #[serde(default)]
+    pub capability_ids: Vec<CapabilityId>,
+}
+
 // ─────────────────────────────────────────────
 // Chat reply (PHAROH → bridge → TUI)
 // ─────────────────────────────────────────────
@@ -289,16 +347,20 @@ pub struct ChatReply {
 }
 
 // ─────────────────────────────────────────────
-// Events flowing from the backend to the TUI
+// Events flowing from the backend to heralds
 // ─────────────────────────────────────────────
 
 #[derive(Debug)]
-pub enum TuiEvent {
+pub enum HeraldEvent {
     /// Completed assistant turn, ready to display.
     AssistantMessage(ChatReply),
+    /// Non-LLM runtime status update.
+    Status(StatusEvent),
     /// Non-fatal error to surface to the user.
     Error(String),
 }
+
+pub type TuiEvent = HeraldEvent;
 
 // ═════════════════════════════════════════════
 // Phase 3 — Envelope & Control Plane
@@ -405,12 +467,32 @@ pub struct HeraldEnvelope {
     pub payload: HeraldPayload,
 }
 
+#[derive(Debug, Clone)]
+pub struct BackendRequest {
+    pub channel: ChannelId,
+    pub payload: HeraldPayload,
+    pub reply_tx: tokio::sync::mpsc::Sender<HeraldEvent>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub String);   // e.g. "tui", "telegram", "web"
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeraldAttachment {
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub pointer: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HeraldPayload {
     Text(String),
+    Message {
+        text: String,
+        attachments: Vec<HeraldAttachment>,
+        artifact_handles: Vec<String>,
+        session: Option<SessionName>,
+    },
     Command(ParsedCommand),
     Attachment { mime_type: String, size_bytes: u64, pointer: String },
 }
@@ -438,6 +520,21 @@ pub enum ParsedCommand {
     SkillSearch { query: String },
     /// Install a skill from a local directory into the workspace skills folder.
     SkillInstall { source: String },
+    /// Reload installed skills into the live registries without restarting.
+    SkillsReload,
+    AutomationsList,
+    AutomationShow { name: String },
+    AutomationRun { name: String },
+    AutomationPause { name: String },
+    AutomationResume { name: String },
+    AutomationCreate { name: String, schedule: String, prompt: String },
+    AutomationEdit { name: String, schedule: String, prompt: String },
+    AutomationDelete { name: String },
+    RunsList,
+    RunShow { handle: String },
+    RunStart { title: String, prompt: String },
+    RunOpen { handle: String },
+    RunCancel { handle: String },
     ArtifactsList,
     ArtifactImport { path: String },
     ArtifactShow { handle: String },
@@ -459,6 +556,34 @@ pub enum ParsedCommand {
     SecretDelete { key: String },
     /// Start Google OAuth flow.
     AuthGoogle,
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationRegistry {
+    inner: Arc<Mutex<HashSet<String>>>,
+}
+
+impl CancellationRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn request_cancel(&self, key: impl Into<String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.insert(key.into());
+        }
+    }
+
+    pub fn clear(&self, key: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.remove(key);
+        }
+    }
+
+    pub fn is_cancelled(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.contains(key))
+            .unwrap_or(false)
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -511,6 +636,8 @@ pub struct TaskSpec {
     pub model_policy: Option<ModelSelectionPolicy>,
     /// IDs only — resolved from the process-global CapabilityRegistry.
     pub capability_refs: Vec<CapabilityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_key: Option<String>,
     pub retry: RetryPolicy,
     pub allow_sub_vizier: bool,
 }
@@ -581,6 +708,15 @@ pub struct ToolCallRecord {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BackgroundRunStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 // ─────────────────────────────────────────────
 // ControlMessage — PHAROH/RA → any component
 // Never passed to an LLM.
@@ -624,6 +760,17 @@ pub enum StatusKind {
     SessionState   { session_id: SessionId, state: SessionState },
     WorkflowState  { workflow_id: WorkflowId, state: WorkflowState },
     StepState      { workflow_id: WorkflowId, step_id: StepId, state: StepState },
+    RunCompleted   {
+        handle: String,
+        session_name: String,
+        title: String,
+        status: BackgroundRunStatus,
+        summary: String,
+        error: Option<String>,
+        automation_id: Option<String>,
+        started_at_ms: u64,
+        finished_at_ms: u64,
+    },
     HeartBeat      { session_id: SessionId },
 }
 
@@ -827,7 +974,7 @@ pub trait Tool: Send + Sync {
     async fn call(&self, input: serde_json::Value) -> Result<serde_json::Value, MaatError>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CapabilityRegistry {
     cards: HashMap<CapabilityId, CapabilityCard>,
 }
@@ -946,6 +1093,7 @@ impl ModelRegistry {
             model_id: profile.model_id.clone(),
             base_url: provider.base_url.clone(),
             api_key_env: provider.api_key_env.clone(),
+            supports_vision_input: profile.traits.contains(&ModelTrait::Vision),
             temperature: profile.temperature,
             max_tokens: profile.max_tokens,
         })
@@ -1180,7 +1328,7 @@ fn tokenize_terms(text: &str) -> Vec<String> {
 // Tool registry — process-global, built once at startup
 // ─────────────────────────────────────────────
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
@@ -1241,6 +1389,9 @@ impl ToolRegistry {
 pub enum MaatError {
     #[error("LLM error: {0}")]
     Llm(String),
+
+    #[error("Cancelled")]
+    Cancelled,
 
     #[error("Config error: {0}")]
     Config(String),
